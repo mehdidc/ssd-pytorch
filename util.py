@@ -5,6 +5,7 @@ import cv2
 from itertools import chain
 from joblib import Memory
 from hashlib import md5
+import pandas as pd
 
 X, Y, W, H, CLASS_ID, MASK = list(range(6))
 BOUNDING_BOX = list(range(4))
@@ -221,6 +222,8 @@ def iou(bbox1, bbox2):
 
     float
     """
+    bbox1 = uncenter_bounding_box(bbox1)
+    bbox2 = uncenter_bounding_box(bbox2)
     x, y, w, h = bbox1
     xx, yy, ww, hh = bbox2
     winter = min(x + w, xx + ww) - max(x, xx)
@@ -235,7 +238,9 @@ def iou(bbox1, bbox2):
 
 def draw_bounding_boxes(image, bbox_list, color=[1.0, 1.0, 1.0], text_color=(1, 1, 1), font=cv2.FONT_HERSHEY_PLAIN, font_scale=1.0):
     image = image.copy()
-    for (x, y, w, h), class_name in bbox_list:
+    for bbox, class_name in bbox_list:
+        bbox = uncenter_bounding_box(bbox)
+        x, y, w, h = bbox
         if x < image.shape[1] and y < image.shape[0] and x + w < image.shape[1] and y + h < image.shape[0]:
             x = int(x)
             y = int(y)
@@ -308,6 +313,17 @@ def rescale_bounding_box(bbox, from_size, to_size):
     h = (h / from_size[1]) * to_size[1]
     return x, y, w, h
 
+def center_bounding_box(bbox):
+    x, y, w, h = bbox
+    x = x + w / 2
+    y = y + h / 2
+    return x, y, w, h
+
+def uncenter_bounding_box(bbox):
+    x, y, w, h = bbox
+    x = x - w / 2
+    y = y - h / 2
+    return x, y, w, h
 
 def softmax(x, axis=1):
     e_x = np.exp(x - x.max(axis=axis, keepdims=True))
@@ -316,6 +332,30 @@ def softmax(x, axis=1):
 def smooth_l1(x, y):
     d = torch.abs(x - y)
     return (d<1).float() * 0.5 * d**2 + (d>=1).float() * (d - 0.5)
+
+
+def precision(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
+    if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
+        return 0
+    M = matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=iou_threshold)
+    return (M.sum(axis=0) > 0).astype('float32').mean()
+
+
+def recall(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
+    if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
+        return 0
+    M = matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=iou_threshold)
+    return (M.sum(axis=1) > 0).astype('float32').mean()
+
+
+def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
+    M = np.zeros((len(bbox_pred_list), len(bbox_true_list)))
+    for i, (bp, cp) in enumerate(bbox_pred_list):
+        for j, (bt, ct) in enumerate(bbox_true_list):
+            if iou(bt, bp) > iou_threshold and cp == ct:
+                M[i, j] = 1
+    return M
+
 
 if __name__ == '__main__':
     from skimage.io import imread

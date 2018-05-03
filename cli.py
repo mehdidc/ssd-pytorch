@@ -4,6 +4,7 @@ from collections import defaultdict
 from clize import run
 import json
 from skimage.io import imsave
+import pandas as pd
 
 import torchvision.transforms as transforms
 import torch.nn as nn
@@ -16,7 +17,9 @@ from torch.autograd import Variable
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 from torchvision import models
 from model import SSD
+
 from dataset import COCO
+from dataset import SubSample
 
 from util import encode_bounding_box_list
 from util import encode_bounding_box_list_one_to_one
@@ -30,12 +33,10 @@ from util import draw_bounding_boxes
 from util import softmax
 from util import non_maximal_suppression
 from util import non_maximal_suppression_per_class
+from util import precision
+from util import recall
 
 cudnn.benchmark = True
-
-def mse(x, y, **kwargs):
-    return 0.5 * (x - y) ** 2
-
 
 def train(*, folder='coco', resume=False, out_folder='out'):
     lambda_ = 1 # weight given to the classification loss relative to localization loss
@@ -46,6 +47,9 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     gamma = 0.9
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
+    imbalance_strategy = 'hard_negative_mining'
+    pos_weight = 1
+    neg_weight = 0.3
 
     normalize = transforms.Normalize(mean=mean, std=std)
  
@@ -61,7 +65,9 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     ])
 
     train_dataset = COCO(folder, split='train2014', transform=train_transform)
+    train_dataset = SubSample(train_dataset, nb=1000)
     valid_dataset = COCO(folder, split='val2014', transform=valid_transform)
+    valid_dataset = SubSample(valid_dataset, nb=500)
     train_loader = DataLoader(
         train_dataset, 
         shuffle=True, 
@@ -94,6 +100,12 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     
     if resume:
         model = torch.load('model.th')
+        if os.path.exists('stats.csv'):
+            stats = pd.read_csv('stats.csv').to_dict(orient='list')
+            first_epoch = max(stats['epoch']) + 1
+        else:
+            stats = defaultdict(list)
+            first_epoch = 0
     else:
         model = SSD(
             num_anchors=list(map(len, aspect_ratios)), 
@@ -104,8 +116,9 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         model.nb_values_per_anchor = nb_values_per_anchor
         model.anchor_list = anchor_list
         model.image_size = image_size
-    pos_weight = 1
-    neg_weight = 0.3
+        first_epoch = 0
+        stats = defaultdict(list)
+    
     class_weight = torch.zeros(nb_classes)
     class_weight[0] = neg_weight
     class_weight[1:] = pos_weight
@@ -117,7 +130,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
 
     avg_loss = 0.
     nb_updates = 0
-    for epoch in range(num_epoch):
+    for epoch in range(first_epoch, num_epoch):
         model.train()
         for batch, samples, in enumerate(train_loader):
             X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
@@ -131,8 +144,6 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             l_loc = 0
             l_classif = 0
             for i in range(len(Y)):
-                #if i != 0:
-                #    continue
                 m = masks[i]
                 bt = bbox_true[i]
                 bp = bbox_pred[i]
@@ -140,30 +151,32 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 cp = class_pred[i]
                 nb_pos = m.view(m.size(0), -1).sum(1).view(m.size(0), 1, 1, 1, 1)
                 nb_neg = (1 - m).view(m.size(0), -1).sum(1).view(m.size(0), 1, 1, 1, 1)
-                #print(nb_pos.view(-1).data[0], nb_neg.view(-1).data[0])
-                #print(bt.min().data[0], bt.max().data[0], bp.min().data[0], bp.max().data[0])
                 nb_examples = m.size(0)
-                N = (nb_pos + 1) * nb_examples
+                N = (nb_pos + 1) * (nb_examples)
                 l_loc = ((m * smooth_l1_loss(bp, bt, size_average=False, reduce=False)) / N).sum() + l_loc
                 
-                # Hard negative mining
-                ind = torch.arange(len(ct))
-                pos = ind[(ct.data.cpu() > 0)].long().cuda()
-                neg = ind[(ct.data.cpu() == 0)].long().cuda()
-                
-                ct_pos = ct[pos]
-                cp_pos = cp[pos]
-                ct_neg = ct[neg]
-                cp_neg = cp[neg]
-                cp_neg_s = nn.Softmax(dim=1)(cp_neg)
+                if imbalance_strategy == 'hard_negative_mining':
+                    # Hard negative mining
+                    ind = torch.arange(len(ct))
+                    pos = ind[(ct.data.cpu() > 0)].long().cuda()
+                    neg = ind[(ct.data.cpu() == 0)].long().cuda()
+                    
+                    ct_pos = ct[pos]
+                    cp_pos = cp[pos]
+                    ct_neg = ct[neg]
+                    cp_neg = cp[neg]
+                    cp_neg_s = nn.Softmax(dim=1)(cp_neg)
 
-                vals, indices = cp_neg_s[:, 0].sort(descending=False)
-                nb = len(ct_pos) * 3
-                cp_neg = cp_neg[indices[0:nb]]
-                ct_neg = ct_neg[indices[0:nb]]
-                #print(nn.Softmax(dim=1)(cp_neg)[:, 0])
-                #print(len(ct_pos), len(ct_neg), len(ct_pos)/len(ct_neg))
-                l_classif = cross_entropy(cp_pos, ct_pos) + cross_entropy(cp_neg, ct_neg) + l_classif
+                    vals, indices = cp_neg_s[:, 0].sort(descending=False)
+                    nb = len(ct_pos) * 3
+                    cp_neg = cp_neg[indices[0:nb]]
+                    ct_neg = ct_neg[indices[0:nb]]
+                    l_classif = cross_entropy(cp_pos, ct_pos) + cross_entropy(cp_neg, ct_neg) + l_classif
+                elif imbalance_strategy == 'class_weight':
+                    l_classif = cross_entropy(cp, ct, weight=class_weight) + l_classif
+                elif imbalance_strategy == 'nothing':
+                    l_classif = cross_entropy(cp, ct) + l_classif
+
             model.zero_grad()
             loss = l_loc + lambda_ * l_classif
             loss.backward()
@@ -175,39 +188,54 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 X = X.data.cpu().numpy()
                 Y = [y.data.cpu().numpy() for y in Y]
                 Ypred = [ypr.data.cpu().numpy() for ypr in Ypred]
-                for idx in range(len(X)):
-                    x = X[idx]
+                for i in range(len(X)):
+                    x = X[i]
                     x = x.transpose((1, 2, 0))
                     x = x * np.array(std) + np.array(mean)
                     x = x.astype('float32')
                     gt_boxes = []
                     pred_boxes = []
-                    for i in range(len(Y)):
-                        #if i != 0:
-                        #    continue
-                        y = Y[i][idx, :, 0:5]#x,y,w,h,cl
-                        ypred = Ypred[i][idx, :]#x,y,w,h,cl0_score,cl1_score,cl2_score,...
-                        #ypred[:, 0:4] = y[:, 0:4]
-                        #ypred[:, 5] = 1000
-                        A = model.anchor_list[i]
-                        
+                    for j in range(len(Y)):
+                        y = Y[j][i, :, 0:5]#x,y,w,h,cl
+                        ypred = Ypred[j][i, :]#x,y,w,h,cl0_score,cl1_score,cl2_score,...
+                        A = model.anchor_list[j]
                         boxes = decode_bounding_box_list(y, A, include_scores=False)
                         gt_boxes.extend(boxes)
-                        
                         boxes = decode_bounding_box_list(ypred, A, include_scores=True)
                         pred_boxes.extend(boxes)
-                    pred_boxes = sorted(pred_boxes, key=lambda p:p[2])[::-1]
                     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
-                    
-                    #gt_boxes = samples[idx][1]
                     gt_boxes = [(box, train_dataset.class_name[class_id]) for box, class_id in gt_boxes]
                     pred_boxes = [(box, train_dataset.class_name[class_id]) for box, class_id in pred_boxes]
                     x = draw_bounding_boxes(x, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0))
                     x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
-                    imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(idx)), x)
+                    imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), x)
             nb_updates += 1
-            #break
         model.eval()
+        metrics = defaultdict(list)
+        for split_name, loader in (('train', train_loader), ('valid', valid_loader)):
+            for batch, samples, in enumerate(loader):
+                X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
+                Y = [y.data.cpu().numpy() for y in Y]
+                Ypred = [ypr.data.cpu().numpy() for ypr in Ypred]
+                for i in range(len(X)):
+                    gt_boxes = samples[i][1]
+                    pred_boxes = []
+                    for j in range(len(Y)):
+                        ypred = Ypred[j][i, :]
+                        A = model.anchor_list[j]
+                        boxes = decode_bounding_box_list(ypred, A, include_scores=True)
+                        pred_boxes.extend(boxes)
+                    pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+                    prec = precision(pred_boxes, gt_boxes)
+                    re = recall(pred_boxes, gt_boxes)
+                    metrics['precision_' + split_name].append(prec)
+                    metrics['recall_' + split_name].append(re)
+        for k in sorted(metrics.keys()):
+            v = np.mean(metrics[k])
+            print('{}: {:.4}'.format(k, v))
+            stats[k].append(v)
+        stats['epoch'].append(epoch)
+        pd.DataFrame(stats).to_csv('stats.csv', index=False)
 
 
 def _predict(model, samples):

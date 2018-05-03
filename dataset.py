@@ -7,6 +7,8 @@ import os
 import numpy as np
 
 from util import rescale_bounding_box
+from util import center_bounding_box
+
 
 class COCO(Dataset):
     """
@@ -82,11 +84,28 @@ class COCO(Dataset):
             x = self.transform(x)
         to_size = x.size(2), x.size(1)
         boxes = self.boxes[i]
+        boxes = [(center_bounding_box(box), class_id) for box, class_id in boxes]
         boxes = [(rescale_bounding_box(box, from_size, to_size), self.class_to_idx[cat]) for box, cat in boxes]
         return x, boxes
     
     def __len__(self):
         return len(self.filenames)
+
+
+class SubSample:
+
+    def __init__(self, dataset, nb):
+        self.dataset = dataset
+        self.nb = nb
+        self.classes = dataset.classes
+        self.class_name = dataset.class_name
+
+    def __getitem__(self, i):
+        return self.dataset[i]
+        
+    def __len__(self):
+        return self.nb
+
 
 
 if __name__ == '__main__':
