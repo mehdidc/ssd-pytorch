@@ -8,6 +8,7 @@ from hashlib import md5
 
 X, Y, W, H, CLASS_ID, MASK = list(range(6))
 BOUNDING_BOX = list(range(4))
+eps = 1e-10
 
 def memo(f):
     cache = {}
@@ -121,8 +122,8 @@ def encode_bounding_box_list_many_to_one(bbox_list, anchors, iou_threshold=0.5):
                 E[k, MASK, ha, wa] = best_iou > iou_threshold
                 E[k, X, ha, wa] = (bx - ax) / aw
                 E[k, Y, ha, wa] = (by - ay) / ah
-                E[k, W, ha, wa] = np.log(bw / aw)
-                E[k, H, ha, wa] = np.log(bh / ah)
+                E[k, W, ha, wa] = np.log(eps + bw / aw)
+                E[k, H, ha, wa] = np.log(eps + bh / ah)
                 E[k, CLASS_ID, ha, wa] = class_id
     return E
 
@@ -158,8 +159,8 @@ def encode_bounding_box_list_one_to_one(bbox_list, anchors, iou_threshold=0.5):
         E[best_k, MASK, best_ha, best_wa] = 1#best_iou > iou_threshold
         E[best_k, X, best_ha, best_wa] = ((bx - ax) / aw)
         E[best_k, Y, best_ha, best_wa] = ((by - ay) / ah)
-        E[best_k, W, best_ha, best_wa] = np.log(bw / aw)
-        E[best_k, H, best_ha, best_wa] = np.log(bh / ah)
+        E[best_k, W, best_ha, best_wa] = np.log(eps + bw / aw)
+        E[best_k, H, best_ha, best_wa] = np.log(eps + bh / ah)
         E[best_k, CLASS_ID, best_ha, best_wa] = class_id
     return E
 

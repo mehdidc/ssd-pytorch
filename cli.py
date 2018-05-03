@@ -144,7 +144,6 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 #print(bt.min().data[0], bt.max().data[0], bp.min().data[0], bp.max().data[0])
                 nb_examples = m.size(0)
                 N = (nb_pos + 1) * nb_examples
-                print(bt.sum())
                 l_loc = ((m * smooth_l1_loss(bp, bt, size_average=False, reduce=False)) / N).sum() + l_loc
                 
                 # Hard negative mining
