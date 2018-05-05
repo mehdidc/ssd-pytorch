@@ -197,7 +197,7 @@ def decode_bounding_box_list(E, anchors, include_scores=False):
                     scores = E[k, len(BOUNDING_BOX):, ha, wa]
                     scores = softmax(scores, axis=0)
                     class_id = scores.argmax()
-                    score = 1.0 - scores[0]
+                    score = scores[class_id]
                     if class_id > 0: # not background
                         bbox_list.append((bbox, class_id, score))
                 else:

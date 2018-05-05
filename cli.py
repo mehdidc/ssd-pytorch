@@ -17,6 +17,7 @@ from torch.autograd import Variable
 from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
 from torchvision import models
 from model import SSD
+from torchvision.datasets.folder import default_loader
 
 from dataset import COCO
 from dataset import SubSample
@@ -118,6 +119,10 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         model.image_size = image_size
         first_epoch = 0
         stats = defaultdict(list)
+   
+    model.class_name = train_dataset.class_name
+    model.mean = mean
+    model.std = std
     
     class_weight = torch.zeros(nb_classes)
     class_weight[0] = neg_weight
@@ -275,5 +280,35 @@ def _predict(model, samples):
 
     return X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks
 
+def test(filename, *, out='out.png'):
+    model = torch.load('model.th', map_location=lambda storage, loc: storage)
+    im = default_loader(filename)
+    x = model.transform(im)
+    X = x.view(1, x.size(0), x.size(1), x.size(2))
+    X = Variable(X)
+    Ypred = model(X)
+    Ypred = [ypr.view(ypr.size(0), len(model.aspect_ratios[i]), model.nb_values_per_anchor, ypr.size(2), ypr.size(3))     
+             for i, ypr in enumerate(Ypred)]
+    Ypred = [ypr.data.cpu().numpy() for ypr in Ypred]
+    X = X.data.cpu().numpy()
+    x = X[0]
+    x = x.transpose((1, 2, 0))
+    x = x * np.array(model.std) + np.array(model.mean)
+    x = x.astype('float32')
+    pred_boxes = []
+    for j in range(len(Ypred)):
+        ypred = Ypred[j][0, :]#x,y,w,h,cl0_score,cl1_score,cl2_score,...
+        A = model.anchor_list[j]
+        boxes = decode_bounding_box_list(ypred, A, include_scores=True)
+        pred_boxes.extend(boxes)
+    pred_boxes = sorted(pred_boxes, key=lambda p:p[2], reverse=True)
+    pred_boxes = [(box, class_id, score) for (box, class_id, score) in pred_boxes if score > 0.01]
+    pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+    pred_boxes = [(box, model.class_name[class_id]) for box, class_id in pred_boxes]
+    for box, name in pred_boxes:
+        print(name)
+    x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
+    imsave(out, x)
+
 if __name__ == '__main__':
-    run([train])
+    run([train, test])
