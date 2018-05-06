@@ -89,20 +89,42 @@ class SSD(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=1),
             nn.ReLU(True)
         )
-        self.out1 = nn.Conv2d(512, num_anchors[0] * (4 + num_classes), kernel_size=3, padding=1)
-        self.out2 = nn.Conv2d(512, num_anchors[1] * (4 + num_classes), kernel_size=3, padding=1)
-        self.out3 = nn.Conv2d(256, num_anchors[2] * (4 + num_classes), kernel_size=3, padding=1)
-        self.out4 = nn.Conv2d(256, num_anchors[3] * (4 + num_classes), kernel_size=3, padding=1)
-        self.out5 = nn.Conv2d(256, num_anchors[4] * (4 + num_classes), kernel_size=3, padding=1)
-        self.out6 = nn.Conv2d(256, num_anchors[5] * (4 + num_classes), kernel_size=3, padding=1)
+        self.out1b = nn.Conv2d(512, num_anchors[0] * 4, kernel_size=3, padding=1)
+        self.out1c = nn.Conv2d(512, num_anchors[0] * num_classes, kernel_size=3, padding=1)
         
-        self.norm1 = L2Norm(num_anchors[0] * (4 + num_classes), 20)
-        self.norm2 = L2Norm(num_anchors[1] * (4 + num_classes), 20)
-        self.norm3 = L2Norm(num_anchors[2] * (4 + num_classes), 20)
-        self.norm4 = L2Norm(num_anchors[3] * (4 + num_classes), 20)
-        self.norm5 = L2Norm(num_anchors[4] * (4 + num_classes), 20)
-        self.norm6 = L2Norm(num_anchors[5] * (4 + num_classes), 20)
-  
+        self.out2b = nn.Conv2d(512, num_anchors[1] * 4, kernel_size=3, padding=1)
+        self.out2c = nn.Conv2d(512, num_anchors[1] * num_classes, kernel_size=3, padding=1)
+        
+        self.out3b = nn.Conv2d(256, num_anchors[2] * 4, kernel_size=3, padding=1)
+        self.out3c = nn.Conv2d(256, num_anchors[2] * num_classes, kernel_size=3, padding=1)
+ 
+        self.out4b = nn.Conv2d(256, num_anchors[3] * 4, kernel_size=3, padding=1)
+        self.out4c = nn.Conv2d(256, num_anchors[3] * num_classes, kernel_size=3, padding=1)
+        
+        self.out5b = nn.Conv2d(256, num_anchors[4] * 4, kernel_size=3, padding=1)
+        self.out5c = nn.Conv2d(256, num_anchors[4] * num_classes, kernel_size=3, padding=1)
+        
+        self.out6b = nn.Conv2d(256, num_anchors[5] * 4, kernel_size=3, padding=1)
+        self.out6c = nn.Conv2d(256, num_anchors[5] * num_classes, kernel_size=3, padding=1)
+
+        self.norm1b = L2Norm(num_anchors[0] * 4, 20)
+        self.norm1c = L2Norm(num_anchors[0] * num_classes, 20)
+
+        self.norm2b = L2Norm(num_anchors[1] * 4, 20)
+        self.norm2c = L2Norm(num_anchors[1] * num_classes, 20)
+        
+        self.norm3b = L2Norm(num_anchors[2] * 4, 20)
+        self.norm3c = L2Norm(num_anchors[2] * num_classes, 20)
+ 
+        self.norm4b = L2Norm(num_anchors[3] * 4, 20)
+        self.norm4c = L2Norm(num_anchors[3] * num_classes, 20)
+ 
+        self.norm5b = L2Norm(num_anchors[4] * 4, 20)
+        self.norm5c = L2Norm(num_anchors[4] * num_classes, 20)
+
+        self.norm6b = L2Norm(num_anchors[5] * 4, 20)
+        self.norm6c = L2Norm(num_anchors[5] * num_classes, 20)
+ 
         self.apply(weights_init)
         # pretrained weights
         vgg16 = models.vgg16(pretrained=True)
@@ -115,25 +137,44 @@ class SSD(nn.Module):
     def forward(self, x):
         outs = []
         x = self.base(x)
-        outs.append(self.norm1(self.out1(x)))
+        outs.append((
+            (self.norm1b(self.out1b(x))),
+            (self.norm1c(self.out1c(x)))
+        ))
         x = self.conv5(x)
         x = self.conv6(x)
         x = self.conv7(x)
-        outs.append(self.norm2(self.out2(x)))
+        outs.append((
+            (self.norm2b(self.out2b(x))),
+            (self.norm2c(self.out2c(x)))
+        ))
         x = self.conv8(x)
-        outs.append(self.norm3(self.out3(x)))
+        outs.append((
+            (self.norm3b(self.out3b(x))),
+            (self.norm3c(self.out3c(x)))
+        ))
         x = self.conv9(x)
-        outs.append(self.norm4(self.out4(x)))
+        outs.append((
+            (self.norm4b(self.out4b(x))),
+            (self.norm4c(self.out4c(x)))
+        ))
         x = self.conv10(x)
-        outs.append(self.norm5(self.out5(x)))
+        outs.append((
+            (self.norm5b(self.out5b(x))),
+            (self.norm5c(self.out5c(x)))
+        ))
         x = self.conv11(x)
-        outs.append(self.norm6(self.out6(x)))
+        outs.append((
+            (self.norm6b(self.out6b(x))),
+            (self.norm6c(self.out6c(x)))
+        ) )
         return outs
 
 
 def weights_init(m):
     if isinstance(m, nn.Conv2d):
         xavier_uniform(m.weight.data)
+
 
 class L2Norm(nn.Module):
     '''L2Norm layer across all channels.'''
@@ -154,5 +195,5 @@ if __name__ == '__main__':
     m = SSD()
     x = Variable(torch.randn(1, 3, 300, 300))
     outs = m(x)
-    for o in outs:
-        print(o.size())
+    for a, b in outs:
+        print(a.size(), b.size())
