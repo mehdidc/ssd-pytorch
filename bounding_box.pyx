@@ -16,7 +16,7 @@ cimport numpy as np
 BOUNDING_BOX = X, Y, W, H = list(range(4))
 eps = 1e-10
 
-def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1 / 2, 1 / 3)):
+def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
     """
     Builds a 4-order tensor that represents a set of anchors
 
@@ -54,68 +54,75 @@ def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1,
     return A
 
 
-cpdef tuple encode_bounding_box_list_many_to_one(bbox_list, np.ndarray anchors, iou_threshold=0.5):
-    """
-    Convert a list of groundtruth bounding boxes into into a 4-order tensor
-    that the neural net have to predict.
-
-    Parameters
-    ----------
-
-    - bbox_list : list of couples (bbox, class_id) representing bounding boxes with their
-      corresponding label, where `bbox` is a 4-tuple (x, y, w, h) 
-    - anchors is a 4-order tensor (nb, 4, fh, fw) where:
-        - `nb` is the number of anchors per position in the feature map of size(fh, fw)
-         - we have 4 numbers because each anchor is represented by its bounding box (x, y, w, h)
-    - iou_threshold : float
-        iou threshold which determines whether two boxes overlap or not
-
-    Returns
-    -------
-    
-    np.array of shape (nb, fh, fw, 6) where:
-        - `nb` is the number of anchors per position in the feature map
-        - `fh` and `fw` are respectively the feature map height and width
-        - each position in the feature map is responsible for predicting `nb` anchors
-        - we have 6 numbers per anchor because we need to predict for each bounding box:
-            - x, y, w, h, class_id, mask
-            - x, y, w, h represent the bounding box rectangle relative to the anchor
-            - class_id is the id of the class that is contained the bounding box
-            - mask determines whether a given anchor is responsible for predicting a class or not. 
-              anchors that are not overlapping enough (depending on iou_threshold) with any groundtruth 
-              box have mask = False, while the others have mask=True
-     
-    """
-    B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
-    C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
-    M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
+cpdef list encode_bounding_box_list_many_to_one(bbox_list, anchors_list, iou_threshold=0.5):
+    E = []
+    for anchors in anchors_list:
+        B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
+        C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
+        M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
+        E.append((B, C, M)) 
     if len(bbox_list) == 0:
-        return B, C, M
-    cdef int nbh = anchors.shape[0]
-    cdef int nbw = anchors.shape[1]
-    cdef int nbk = anchors.shape[2]
-    for ha in range(nbh):
-        for wa in range(nbw):
-            for k in range(nbk):
-                anchor = ax, ay, aw, ah = anchors[ha, wa, k]
-                best_iou = 0.
-                best_bbox = bbox_list[0]
-                # Find the groundtruth box that best matches
-                # the anchor box
-                for j, (bbox, class_id) in enumerate(bbox_list):
-                    iou_ = iou(anchor, bbox)
-                    if iou_ < best_iou:
-                        continue
-                    best_iou = iou_
-                    best_bbox = bbox
-                bx, by, bw, bh = best_bbox
-                B[ha, wa, k, X] = (bx - ax) / aw
-                B[ha, wa, k, Y] = (by - ay) / ah
-                B[ha, wa, k, W] = np.log(eps + bw / aw)
-                B[ha, wa, k, H] = np.log(eps + bh / ah)
-                C[ha, wa, k] = class_id
-                M[ha, wa, k] = best_iou > iou_threshold
-    return B, C, M
+        return E
+    
+    for j, (bbox, class_id) in enumerate(bbox_list):
+        for i, anchors in enumerate(anchors_list):
+            nbh = anchors.shape[0]
+            nbw = anchors.shape[1]
+            nbk = anchors.shape[2]
+            best_iou = 0.
+            best_bbox = None
+            best_k = 0
+            best_ha = 0
+            best_wa = 0
+            best_scale = 0
+            for ha in range(nbh):
+                for wa in range(nbw):
+                    for k in range(nbk):
+                        anchor = ax, ay, aw, ah = anchors[ha, wa, k]
+                        iou_ = iou(anchor, bbox)
+                        if iou_ < best_iou:
+                            continue
+                        best_iou = iou_
+                        best_bbox = anchor
+                        best_k = k
+                        best_ha = ha
+                        best_wa = wa
+                        best_scale = i
+            ax, ay, aw, ah = best_bbox
+            bx, by, bw, bh = bbox
+            B, C, M = E[best_scale]
+            B[best_ha, best_wa, best_k, X] = (bx - ax) / aw
+            B[best_ha, best_wa, best_k, Y] = (by - ay) / ah
+            B[best_ha, best_wa, best_k, W] = np.log(eps + bw / aw)
+            B[best_ha, best_wa, best_k, H] = np.log(eps + bh / ah)
+            C[best_ha, best_wa, best_k] = class_id 
+            M[best_ha, best_wa, best_k] = True
+
+    for i, anchors in enumerate(anchors_list):
+        B, C, M = E[i]
+        for ha in range(nbh):
+            for wa in range(nbw):
+                for k in range(nbk):
+                    anchor = ax, ay, aw, ah = anchors[ha, wa, k]
+                    best_iou = 0.
+                    best_bbox = bbox_list[0]
+                    # Find the groundtruth box that best matches
+                    # the anchor box
+                    for j, (bbox, class_id) in enumerate(bbox_list):
+                        iou_ = iou(anchor, bbox)
+                        if iou_ < best_iou:
+                            continue
+                        best_iou = iou_
+                        best_bbox = bbox
+                    if M[ha, wa, k] == False:
+                        bx, by, bw, bh = best_bbox
+                        B[ha, wa, k, X] = (bx - ax) / aw
+                        B[ha, wa, k, Y] = (by - ay) / ah
+                        B[ha, wa, k, W] = np.log(eps + bw / aw)
+                        B[ha, wa, k, H] = np.log(eps + bh / ah)
+                        C[ha, wa, k] = class_id if best_iou > iou_threshold else 0
+                        M[ha, wa, k] = best_iou > iou_threshold
+    return E
 
 
 cpdef tuple encode_bounding_box_list_one_to_one(bbox_list, np.ndarray anchors, iou_threshold=0.5):

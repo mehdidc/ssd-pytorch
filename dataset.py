@@ -9,6 +9,9 @@ import numpy as np
 from util import rescale_bounding_box
 from util import center_bounding_box
 
+import pyximport; pyximport.install()
+from bounding_box import encode_bounding_box_list_many_to_one
+from bounding_box import encode_bounding_box_list_one_to_one
 
 class COCO(Dataset):
     """
@@ -31,12 +34,14 @@ class COCO(Dataset):
     transform : Transform
         pytorch transform to apply to images
     """
-    def __init__(self, folder, split='train2014', transform=None):
+    def __init__(self, folder, anchor_list, split='train2014', transform=None):
         self.imgs_folder = os.path.join(folder, split)
+        self.anchor_list = anchor_list
         self.annotations_folder = os.path.join(folder, 'annotations')
         self.split = split
         self.transform = transform
         self._load_annotations()
+        self.bbox_encodings = {}
 
     def _load_annotations(self):
         A = json.load(open(os.path.join(self.annotations_folder, 'instances_{}.json'.format(self.split))))
@@ -75,8 +80,12 @@ class COCO(Dataset):
         self.class_name = {
             i: (class_id_name[cl] if cl in class_id_name else 'background')
             for i, cl in self.idx_to_class.items()} 
+    
+    def _load_bbox_encodings(self, bboxes):
+        Y = encode_bounding_box_list_many_to_one(bboxes, self.anchor_list)
+        return Y
 
-    def __getitem__(self, i):
+    def _load(self, i):
         filename = self.filenames[i]
         x = default_loader(os.path.join(self.imgs_folder, 'img', filename))
         from_size = x.size
@@ -87,7 +96,15 @@ class COCO(Dataset):
         boxes = [(center_bounding_box(box), class_id) for box, class_id in boxes]
         boxes = [(rescale_bounding_box(box, from_size, to_size), self.class_to_idx[cat]) for box, cat in boxes]
         return x, boxes
-    
+
+    def __getitem__(self, i):
+        x, bboxes = self._load(i)
+        if i in self.bbox_encodings:
+            e = self.bbox_encodings[i]
+        else:
+            e = self._load_bbox_encodings(bboxes)
+        return x, bboxes, e
+
     def __len__(self):
         return len(self.filenames)
 

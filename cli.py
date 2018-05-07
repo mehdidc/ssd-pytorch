@@ -48,7 +48,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     batch_size = 16 
     num_epoch = 100000
     image_size = 300 
-    lr = 0.0001
+    lr = 0.001
     gamma = 0.9
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
@@ -56,8 +56,18 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     pos_weight = 1
     neg_weight = 0.3
 
+    ar = [1, 2, 3, 1/2, 1/3]
+    aspect_ratios = [ar] * 6
+    anchor_list = [
+        build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
+        build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
+        build_anchors(scale=0.48, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
+        build_anchors(scale=0.62, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
+        build_anchors(scale=0.76, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
+        build_anchors(scale=0.90, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
+    ]
+
     normalize = transforms.Normalize(mean=mean, std=std)
- 
     train_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -69,34 +79,23 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         normalize,
     ])
 
-    train_dataset = COCO(folder, split='train2014', transform=train_transform)
-    train_dataset = SubSample(train_dataset, nb=1000)
-    valid_dataset = COCO(folder, split='val2014', transform=valid_transform)
-    valid_dataset = SubSample(valid_dataset, nb=500)
+    train_dataset = COCO(folder, anchor_list, split='train2014', transform=train_transform)
+    #train_dataset = SubSample(train_dataset, nb=16)
+    valid_dataset = COCO(folder, anchor_list, split='val2014', transform=valid_transform)
+    #valid_dataset = SubSample(valid_dataset, nb=16)
     train_loader = DataLoader(
         train_dataset, 
         shuffle=True, 
         batch_size=batch_size, 
         collate_fn=lambda l:l,
-        num_workers=4,
+        num_workers=8,
     )
     valid_loader = DataLoader(
         valid_dataset, 
         batch_size=batch_size, 
         collate_fn=lambda l:l,
-        num_workers=4,
+        num_workers=8,
     )
-    ar = [1, 2, 3, 1/2, 1/3]
-    aspect_ratios = [ar] * 6
-    anchor_list = [
-        build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
-        build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
-        build_anchors(scale=0.48, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
-        build_anchors(scale=0.62, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
-        build_anchors(scale=0.76, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
-        build_anchors(scale=0.90, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
-    ]
-    nb_scales = len(anchor_list)
     nb_classes = len(train_dataset.classes) + 1 # normal classes + background class
     nb_values_per_anchor = 4 + nb_classes # bounding box (4) + nb_classes
     
@@ -106,14 +105,22 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     
     if resume:
         model = torch.load('model.th')
+
         if os.path.exists('stats.csv'):
             stats = pd.read_csv('stats.csv').to_dict(orient='list')
             first_epoch = max(stats['epoch']) + 1
         else:
             stats = defaultdict(list)
             first_epoch = 0
+
+        if os.path.exists('train_stats.csv'):
+            train_stats = pd.read_csv('train_stats.csv').to_dict(orient='list')
+        else:
+            train_stats = defaultdict(list)
+
         if not hasattr(model, 'nb_updates'):
             model.nb_updates = 0
+
     else:
         model = SSD(
             num_anchors=list(map(len, aspect_ratios)), 
@@ -126,6 +133,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         model.image_size = image_size
         first_epoch = 0
         stats = defaultdict(list)
+        train_stats = defaultdict(list)
         model.nb_updates = 0
 
     model.class_name = train_dataset.class_name
@@ -137,18 +145,19 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     class_weight[1:] = pos_weight
     class_weight = class_weight.cuda()
 
-    #cross_entropy = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
     step_size = len(train_dataset) // batch_size
     #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 8)
  
     model = model.cuda()
 
-
     avg_loss = 0.
     for epoch in range(first_epoch, num_epoch):
+        if epoch == 10:
+            break
         model.train()
         for batch, samples, in enumerate(train_loader):
+            t0 = time.time()
             X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
             # X is batch of image
             # Y is groundtruth output
@@ -198,9 +207,22 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 avg_loss = loss.data[0]
             else:
                 avg_loss = avg_loss * gamma + loss.data[0] * (1 - gamma)
-            print('Batch {:05d}/{:05d} Loss : {:.4f} AvgTrainLoss : {:.4f}'.format(batch, len(train_loader), loss.data[0], avg_loss))
+            
+            delta = time.time() - t0
+            print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.4f} AvgTrainLoss : {:.4f} Time:{:.4f}s'.format(
+                epoch,
+                num_epoch,
+                batch, 
+                len(train_loader), 
+                loss.data[0], 
+                avg_loss,
+                delta
+                ))
+            train_stats['avg_loss'].append(avg_loss)
+            train_stats['loss'].append(loss.data[0])
             if model.nb_updates % 100 == 0:
-                #sys.exit(0)
+                pd.DataFrame(train_stats).to_csv('train_stats.csv', index=False)
+                t0 = time.time()
                 torch.save(model, 'model.th')
                 X = X.data.cpu().numpy()
                 
@@ -241,10 +263,15 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                     x = draw_bounding_boxes(x, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0))
                     x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
                     imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), x)
+                delta = time.time() - t0
+                print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
+        
+        t0 = time.time()
         model.eval()
         metrics = defaultdict(list)
         for split_name, loader in (('train', train_loader), ('valid', valid_loader)):
+            t0 = time.time()
             for batch, samples, in enumerate(loader):
                 X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
                 B = [[b for b, c, m in y] for y in Y]
@@ -262,7 +289,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 for bp, cp in Ypred]
  
                 for i in range(len(X)):
-                    gt_boxes = samples[i][1]
+                    _, gt_boxes, _ = samples[i]
                     pred_boxes = []
                     for j in range(len(Y)):
                         cp = CP[j][i]#cl1_score,cl2_score,...
@@ -275,6 +302,10 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                     re = recall(pred_boxes, gt_boxes)
                     metrics['precision_' + split_name].append(prec)
                     metrics['recall_' + split_name].append(re)
+            delta = time.time() - t0
+            print('Eval time of {}: {:.4f}s'.format(split_name, delta))
+
+
         for k in sorted(metrics.keys()):
             v = np.mean(metrics[k])
             print('{}: {:.4}'.format(k, v))
@@ -284,13 +315,13 @@ def train(*, folder='coco', resume=False, out_folder='out'):
 
 
 def _predict(model, samples):
-    X = torch.stack([x for x, _ in samples], 0)
-    bboxes = [y for _, y in samples]
-    
+    X = torch.stack([x for x, _, _ in samples], 0) 
     X = X.cuda()
     X = Variable(X)
     # X has shape (nb_examples, 3, image_size, image_size)
-    Y = [[encode_bounding_box_list_one_to_one(bbox, A) for bbox in bboxes] for A in model.anchor_list]
+    bbox_encodings = [be for _, _, be in samples]
+    Y = list(zip(*bbox_encodings))
+    
     B = [[b for b, c, m in y] for y in Y]
     B = [torch.from_numpy(np.array(b)).float() for b in B]
     C = [[c for b, c, m in y] for y in Y]
