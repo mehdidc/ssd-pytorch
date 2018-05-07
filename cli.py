@@ -145,10 +145,9 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     class_weight[1:] = pos_weight
     class_weight = class_weight.cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     step_size = len(train_dataset) // batch_size
-    #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 8)
- 
+    scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     model = model.cuda()
 
     avg_loss = 0.
