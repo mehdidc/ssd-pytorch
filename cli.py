@@ -103,18 +103,22 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     print('Number of valid images : {}'.format(len(valid_dataset)))
     print('Number of classes : {}'.format(nb_classes))
     
-    if resume:
-        model = torch.load('model.th')
+    stats_filename = os.path.join(out_folder, 'stats.csv')
+    train_stats_filename = os.path.join(out_folder, 'train_stats.csv')
+    model_filename = os.path.join(out_folder, 'model.th')
 
-        if os.path.exists('stats.csv'):
-            stats = pd.read_csv('stats.csv').to_dict(orient='list')
+    if resume:
+        model = torch.load(model_filename)
+
+        if os.path.exists(stats_filename):
+            stats = pd.read_csv(stats_filename).to_dict(orient='list')
             first_epoch = max(stats['epoch']) + 1
         else:
             stats = defaultdict(list)
             first_epoch = 0
 
-        if os.path.exists('train_stats.csv'):
-            train_stats = pd.read_csv('train_stats.csv').to_dict(orient='list')
+        if os.path.exists(train_stats_filename):
+            train_stats = pd.read_csv(train_stats_filename).to_dict(orient='list')
         else:
             train_stats = defaultdict(list)
 
@@ -151,6 +155,8 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     model = model.cuda()
 
     avg_loss = 0.
+    avg_loc = 0.
+    avg_classif = 0.
     for epoch in range(first_epoch, num_epoch):
         if epoch == 10:
             break
@@ -181,14 +187,12 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 ind = torch.arange(len(ct))
                 pos = ind[(ct.data.cpu() > 0)].long().cuda()
                 neg = ind[(ct.data.cpu() == 0)].long().cuda()
-                
                 ct_pos = ct[pos]
                 cp_pos = cp[pos]
                 ct_neg = ct[neg]
                 cp_neg = cp[neg]
-                cp_neg_s = nn.Softmax(dim=1)(cp_neg)
-
-                vals, indices = cp_neg_s[:, 0].sort(descending=False)
+                cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
+                vals, indices = cp_neg_loss.sort(descending=True)
                 nb = len(ct_pos) * 3
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
@@ -204,25 +208,38 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             optimizer.step()
             if avg_loss == 0.0:
                 avg_loss = loss.data[0]
+                avg_loc = l_loc.data[0]
+                avg_classif = l_classif.data[0]
             else:
                 avg_loss = avg_loss * gamma + loss.data[0] * (1 - gamma)
-            
+                avg_loc = avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
+                avg_classif = avg_classif * gamma + l_classif.data[0] * (1 - gamma)
             delta = time.time() - t0
-            print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.4f} AvgTrainLoss : {:.4f} Time:{:.4f}s'.format(
+            print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
+                  'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} AvgClassif {:.3f} Time:{:.3f}s'.format(
                 epoch,
                 num_epoch,
                 batch, 
                 len(train_loader), 
                 loss.data[0], 
+                l_loc.data[0],
+                l_classif.data[0],
                 avg_loss,
+                avg_loc,
+                avg_classif,
                 delta
                 ))
             train_stats['avg_loss'].append(avg_loss)
             train_stats['loss'].append(loss.data[0])
+            train_stats['avg_loc'].append(avg_loc)
+            train_stats['loc'].append(l_loc.data[0])
+            train_stats['avg_classif'].append(avg_classif)
+            train_stats['classif'].append(l_classif.data[0])
+
             if model.nb_updates % 100 == 0:
-                pd.DataFrame(train_stats).to_csv('train_stats.csv', index=False)
+                pd.DataFrame(train_stats).to_csv(train_stats_filename, index=False)
                 t0 = time.time()
-                torch.save(model, 'model.th')
+                torch.save(model, model_filename)
                 X = X.data.cpu().numpy()
                 
                 B = [[b for b, c, m in y] for y in Y]
@@ -310,7 +327,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             print('{}: {:.4}'.format(k, v))
             stats[k].append(v)
         stats['epoch'].append(epoch)
-        pd.DataFrame(stats).to_csv('stats.csv', index=False)
+        pd.DataFrame(stats).to_csv(stats_filename, index=False)
 
 
 def _predict(model, samples):
