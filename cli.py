@@ -96,6 +96,25 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         collate_fn=lambda l:l,
         num_workers=8,
     )
+    
+
+    train_subset = SubSample(train_dataset, nb=1000)
+    valid_subset = SubSample(valid_dataset, nb=1000)
+    
+    train_loader_subset = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        collate_fn=lambda l:l,
+        num_workers=8
+    )
+
+    valid_loader_subset = DataLoader(
+        valid_subset,
+        batch_size=batch_size,
+        collate_fn=lambda l:l,
+        num_workers=8
+    )
+
     nb_classes = len(train_dataset.classes) + 1 # normal classes + background class
     nb_values_per_anchor = 4 + nb_classes # bounding box (4) + nb_classes
     
@@ -158,8 +177,6 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     avg_loc = 0.
     avg_classif = 0.
     for epoch in range(first_epoch, num_epoch):
-        if epoch == 10:
-            break
         model.train()
         for batch, samples, in enumerate(train_loader):
             t0 = time.time()
@@ -204,7 +221,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             model.zero_grad()
             loss = l_loc + lambda_ * l_classif
             loss.backward()
-            #scheduler.batch_step()
+            scheduler.batch_step()
             optimizer.step()
             if avg_loss == 0.0:
                 avg_loss = loss.data[0]
@@ -282,13 +299,14 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
-        
+        print('Evaluation') 
         t0 = time.time()
         model.eval()
         metrics = defaultdict(list)
-        for split_name, loader in (('train', train_loader), ('valid', valid_loader)):
+        for split_name, loader in (('train', train_loader_subset), ('valid', valid_loader_subset)):
             t0 = time.time()
             for batch, samples, in enumerate(loader):
+                tt0 = time.time()
                 X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
                 B = [[b for b, c, m in y] for y in Y]
                 B = [torch.from_numpy(np.array(b)).float() for b in B]
@@ -318,9 +336,10 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                     re = recall(pred_boxes, gt_boxes)
                     metrics['precision_' + split_name].append(prec)
                     metrics['recall_' + split_name].append(re)
+                delta = time.time() - tt0
+                print('Eval Batch {:04d}/{:04d} on split {} Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
             delta = time.time() - t0
             print('Eval time of {}: {:.4f}s'.format(split_name, delta))
-
 
         for k in sorted(metrics.keys()):
             v = np.mean(metrics[k])
@@ -370,20 +389,25 @@ def _predict(model, samples):
     return X, (Y, Ypred), (bt, bp), (ct, cp), M
 
 
-def test(filename, *, model='model.th', out='out.png'):
+def test(filename, *, model='out/model.th', out='out.png', cuda=False):
     model = torch.load(model, map_location=lambda storage, loc: storage)
+    if cuda:
+        model = model.cuda()
     model.eval()
     im = default_loader(filename)
     x = model.transform(im)
     X = x.view(1, x.size(0), x.size(1), x.size(2))
-    
+    if cuda:
+        X = X.cuda()
     X = Variable(X)
     Ypred = model(X)
-    Ypred = [
-        ypr.view(ypr.size(0), len(model.aspect_ratios[i]), model.nb_values_per_anchor, ypr.size(2), ypr.size(3))     
-        for i, ypr in enumerate(Ypred)
-    ]
-    Ypred = [ypr.data.cpu().numpy() for ypr in Ypred]
+    BP = [
+        bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+    for bp, cp in Ypred]
+    CP = [
+        cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+    for bp, cp in Ypred]
+
     X = X.data.cpu().numpy()
     x = X[0]
     x = x.transpose((1, 2, 0))
@@ -391,9 +415,10 @@ def test(filename, *, model='model.th', out='out.png'):
     x = x.astype('float32')
     pred_boxes = []
     for j in range(len(Ypred)):
-        ypred = Ypred[j][0, :]#x,y,w,h,cl0_score,cl1_score,cl2_score,...
+        cp = CP[j][0]#cl1_score,cl2_score,...
+        bp = BP[j][0]#4
         A = model.anchor_list[j]
-        boxes = decode_bounding_box_list(ypred, A, include_scores=True)
+        boxes = decode_bounding_box_list(bp, cp, A, include_scores=True)
         pred_boxes.extend(boxes)
     pred_boxes = sorted(pred_boxes, key=lambda p:p[2], reverse=True)
     pred_boxes = [(box, class_id, score) for (box, class_id, score) in pred_boxes if score > 0.01]
