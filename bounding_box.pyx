@@ -12,8 +12,7 @@ from util import softmax
 
 cimport numpy as np
 
-
-BOUNDING_BOX = X, Y, W, H = list(range(4))
+X, Y, W, H = 0, 1, 2, 3
 eps = 1e-10
 
 def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
@@ -54,16 +53,23 @@ def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1,
     return A
 
 
-cpdef list encode_bounding_box_list_many_to_one(bbox_list, anchors_list, iou_threshold=0.5):
+cpdef list encode_bounding_box_list_many_to_one(
+        bbox_list, 
+        anchors_list, 
+        variance=[0.1, 0.1, 0.2, 0.2], 
+        background_class_id=0, 
+        iou_threshold=0.5):
+
     E = []
     for anchors in anchors_list:
         B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
         C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
+        C[:] = background_class_id
         M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
         E.append((B, C, M)) 
     if len(bbox_list) == 0:
         return E
-    
+    # For each groundtruth box, match the best anchor
     for j, (bbox, class_id) in enumerate(bbox_list):
         for i, anchors in enumerate(anchors_list):
             nbh = anchors.shape[0]
@@ -91,13 +97,14 @@ cpdef list encode_bounding_box_list_many_to_one(bbox_list, anchors_list, iou_thr
             ax, ay, aw, ah = best_bbox
             bx, by, bw, bh = bbox
             B, C, M = E[best_scale]
-            B[best_ha, best_wa, best_k, X] = (bx - ax) / aw
-            B[best_ha, best_wa, best_k, Y] = (by - ay) / ah
-            B[best_ha, best_wa, best_k, W] = np.log(eps + bw / aw)
-            B[best_ha, best_wa, best_k, H] = np.log(eps + bh / ah)
+            B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw) / variance[0]
+            B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah) / variance[1]
+            B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
+            B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
             C[best_ha, best_wa, best_k] = class_id 
             M[best_ha, best_wa, best_k] = True
-
+    # match each anchor to the groundtruth box with best iou
+    # if the best iou > iou_threshold
     for i, anchors in enumerate(anchors_list):
         B, C, M = E[i]
         for ha in range(nbh):
@@ -116,18 +123,25 @@ cpdef list encode_bounding_box_list_many_to_one(bbox_list, anchors_list, iou_thr
                         best_bbox = bbox
                     if M[ha, wa, k] == False:
                         bx, by, bw, bh = best_bbox
-                        B[ha, wa, k, X] = (bx - ax) / aw
-                        B[ha, wa, k, Y] = (by - ay) / ah
-                        B[ha, wa, k, W] = np.log(eps + bw / aw)
-                        B[ha, wa, k, H] = np.log(eps + bh / ah)
-                        C[ha, wa, k] = class_id if best_iou > iou_threshold else 0
+                        B[ha, wa, k, X] = ((bx - ax) / aw) / variance[0]
+                        B[ha, wa, k, Y] = ((by - ay) / ah) / variance[1]
+                        B[ha, wa, k, W] = (np.log(eps + bw / aw)) / variance[2]
+                        B[ha, wa, k, H] = (np.log(eps + bh / ah)) / variance[3]
+                        C[ha, wa, k] = class_id if best_iou > iou_threshold else background_class_id
                         M[ha, wa, k] = best_iou > iou_threshold
     return E
 
 
-cpdef tuple encode_bounding_box_list_one_to_one(bbox_list, np.ndarray anchors, iou_threshold=0.5):
+cpdef tuple encode_bounding_box_list_one_to_one(
+    bbox_list, 
+    np.ndarray anchors, 
+    variance=[0.1, 0.1, 0.2, 0.2], 
+    background_class_id=0, 
+    iou_threshold=0.5):
+
     B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
     C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
+    C[:] = background_class_id
     M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
     cdef int nbh = anchors.shape[0]
     cdef int nbw = anchors.shape[1]
@@ -157,16 +171,16 @@ cpdef tuple encode_bounding_box_list_one_to_one(bbox_list, np.ndarray anchors, i
         ax, ay, aw, ah = best_bbox
         bx, by, bw, bh = bbox
         
-        B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw)
-        B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah)
-        B[best_ha, best_wa, best_k, W] = np.log(eps + bw / aw)
-        B[best_ha, best_wa, best_k, H] = np.log(eps + bh / ah)
+        B[best_ha, best_wa, best_k, X] = (((bx - ax) / aw)) / variance[0]
+        B[best_ha, best_wa, best_k, Y] = (((by - ay) / ah)) / variance[1]
+        B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
+        B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
         C[best_ha, best_wa, best_k] = class_id
         M[best_ha, best_wa, best_k] = True#best_iou > iou_threshold
     return B, C, M
 
 
-def decode_bounding_box_list(B, C, anchors, include_scores=False):
+def decode_bounding_box_list(B, C, anchors, variance=[0.1, 0.1, 0.2, 0.2], background_class_id=0, include_scores=False):
     """
     Convert a 4-th order tensor of encoded bounding boxes into a list of
     detected bounding boxes
@@ -183,6 +197,10 @@ def decode_bounding_box_list(B, C, anchors, include_scores=False):
         for wa in range(anchors.shape[1]):
             for k in range(anchors.shape[2]):
                 bx, by, bw, bh = B[ha, wa, k]
+                bx = bx * variance[0]
+                by = by * variance[1]
+                bw = bw * variance[2]
+                bh = bh * variance[3]
                 ax, ay, aw, ah = anchors[ha, wa, k]
                 x = bx * aw + ax
                 y = by * ah + ay
@@ -194,11 +212,11 @@ def decode_bounding_box_list(B, C, anchors, include_scores=False):
                     scores = softmax(scores, axis=0)
                     class_id = scores.argmax()
                     score = scores[class_id]
-                    if class_id > 0: # not background
+                    if class_id != background_class_id: # not background
                         bbox_list.append((bbox, class_id, score))
                 else:
                     class_id = C[ha, wa, k]
-                    if class_id > 0: # not background
+                    if class_id != background_class_id: # not background
                         bbox_list.append((bbox, class_id))
     return bbox_list 
 
@@ -286,6 +304,7 @@ def non_maximal_suppression(bbox_list, iou_threshold=0.5):
             L.remove(r)
         final_bbox_list.append((bbox, class_id))
     return final_bbox_list
+
 
 def precision(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:

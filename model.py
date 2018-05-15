@@ -107,23 +107,24 @@ class SSD(nn.Module):
         self.out6b = nn.Conv2d(256, num_anchors[5] * 4, kernel_size=3, padding=1)
         self.out6c = nn.Conv2d(256, num_anchors[5] * num_classes, kernel_size=3, padding=1)
 
-        self.norm1b = L2Norm(num_anchors[0] * 4, 20)
-        self.norm1c = L2Norm(num_anchors[0] * num_classes, 20)
+        S = 20
+        self.norm1b = L2Norm(num_anchors[0] * 4, S)
+        self.norm1c = L2Norm(num_anchors[0] * num_classes, S)
 
-        self.norm2b = L2Norm(num_anchors[1] * 4, 20)
-        self.norm2c = L2Norm(num_anchors[1] * num_classes, 20)
+        self.norm2b = L2Norm(num_anchors[1] * 4, S)
+        self.norm2c = L2Norm(num_anchors[1] * num_classes, S)
         
-        self.norm3b = L2Norm(num_anchors[2] * 4, 20)
-        self.norm3c = L2Norm(num_anchors[2] * num_classes, 20)
+        self.norm3b = L2Norm(num_anchors[2] * 4, S)
+        self.norm3c = L2Norm(num_anchors[2] * num_classes, S)
  
-        self.norm4b = L2Norm(num_anchors[3] * 4, 20)
-        self.norm4c = L2Norm(num_anchors[3] * num_classes, 20)
+        self.norm4b = L2Norm(num_anchors[3] * 4, S)
+        self.norm4c = L2Norm(num_anchors[3] * num_classes, S)
  
-        self.norm5b = L2Norm(num_anchors[4] * 4, 20)
-        self.norm5c = L2Norm(num_anchors[4] * num_classes, 20)
+        self.norm5b = L2Norm(num_anchors[4] * 4, S)
+        self.norm5c = L2Norm(num_anchors[4] * num_classes, S)
 
-        self.norm6b = L2Norm(num_anchors[5] * 4, 20)
-        self.norm6c = L2Norm(num_anchors[5] * num_classes, 20)
+        self.norm6b = L2Norm(num_anchors[5] * 4, S)
+        self.norm6c = L2Norm(num_anchors[5] * num_classes, S)
  
         self.apply(weights_init)
         # pretrained weights

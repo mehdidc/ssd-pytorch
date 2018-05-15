@@ -23,6 +23,7 @@ from model import SSD
 from torchvision.datasets.folder import default_loader
 
 from dataset import COCO
+from dataset import VOC
 from dataset import SubSample
 
 from util import draw_bounding_boxes
@@ -30,8 +31,6 @@ from util import softmax
 from optim import CyclicLR
 
 import pyximport; pyximport.install()
-from bounding_box import encode_bounding_box_list_many_to_one
-from bounding_box import encode_bounding_box_list_one_to_one
 from bounding_box import decode_bounding_box_list
 from bounding_box import non_maximal_suppression
 from bounding_box import non_maximal_suppression_per_class
@@ -53,11 +52,20 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     imbalance_strategy = 'hard_negative_mining'
-    pos_weight = 1
-    neg_weight = 0.3
-
-    ar = [1, 2, 3, 1/2, 1/3]
-    aspect_ratios = [ar] * 6
+    if imbalance_strategy == 'class_weight':
+        pos_weight = 1
+        neg_weight = 0.3
+    dataset = 'VOC'
+    # aspect ratios for each scale (we have 6 scales)
+    aspect_ratios = [
+        [1, 2, 3, 1/2, 1/3],
+        [1, 2, 3, 1/2, 1/3],
+        [1, 2, 3, 1/2, 1/3],
+        [1, 2, 3, 1/2, 1/3],
+        [1, 2, 3, 1/2, 1/3],
+        [1, 2, 3, 1/2, 1/3],
+    ]
+    # anchor list for each scale (we have 6 scales)
     anchor_list = [
         build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
         build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
@@ -66,7 +74,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         build_anchors(scale=0.76, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
         build_anchors(scale=0.90, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
     ]
-
+    # transforms
     normalize = transforms.Normalize(mean=mean, std=std)
     train_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
@@ -78,104 +86,114 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         transforms.ToTensor(),
         normalize,
     ])
+    # dataset for train and valid
+    print('Loading dataset anotations...')
+    if dataset == 'COCO':
+        train_dataset = COCO('coco', anchor_list, split='train2014', transform=train_transform)
+        valid_dataset = COCO('coco', anchor_list, split='val2014', transform=valid_transform)
+    elif dataset == 'VOC':
+        train_dataset = VOC('voc', anchor_list, split='train', transform=train_transform)
+        valid_dataset = VOC('voc', anchor_list, split='val', transform=valid_transform)
+    else:
+        raise ValueError('Unknown dataset')
+    print('Done loading dataset annotations.')
+    train_dataset = SubSample(train_dataset, nb=16)
+    valid_dataset = SubSample(valid_dataset, nb=16)
+    assert train_dataset.class_to_idx == valid_dataset.class_to_idx
+    assert train_dataset.idx_to_class == valid_dataset.idx_to_class
 
-    train_dataset = COCO(folder, anchor_list, split='train2014', transform=train_transform)
-    #train_dataset = SubSample(train_dataset, nb=16)
-    valid_dataset = COCO(folder, anchor_list, split='val2014', transform=valid_transform)
-    #valid_dataset = SubSample(valid_dataset, nb=16)
+    clfn = lambda l:l
+    # Dataset loaders for full training and full validation 
     train_loader = DataLoader(
         train_dataset, 
         shuffle=True, 
         batch_size=batch_size, 
-        collate_fn=lambda l:l,
+        collate_fn=clfn,
         num_workers=8,
     )
     valid_loader = DataLoader(
         valid_dataset, 
         batch_size=batch_size, 
-        collate_fn=lambda l:l,
+        collate_fn=clfn,
         num_workers=8,
     )
-    
 
-    train_subset = SubSample(train_dataset, nb=1000)
-    valid_subset = SubSample(valid_dataset, nb=1000)
-    
+    # Dataset and Loaders for evaluation
+
+    if len(train_dataset) > 1000:
+        train_subset = SubSample(train_dataset, nb=1000)
+        valid_subset = SubSample(valid_dataset, nb=1000)
+    else:
+        train_subset = train_dataset
+        valid_subset = valid_dataset
+
     train_loader_subset = DataLoader(
         train_subset,
         batch_size=batch_size,
-        collate_fn=lambda l:l,
+        collate_fn=clfn,
         num_workers=8
     )
-
     valid_loader_subset = DataLoader(
         valid_subset,
         batch_size=batch_size,
-        collate_fn=lambda l:l,
+        collate_fn=clfn,
         num_workers=8
     )
-
-    nb_classes = len(train_dataset.classes) + 1 # normal classes + background class
-    nb_values_per_anchor = 4 + nb_classes # bounding box (4) + nb_classes
-    
+    nb_classes = len(train_dataset.class_to_idx)
     print('Number of training images : {}'.format(len(train_dataset)))
     print('Number of valid images : {}'.format(len(valid_dataset)))
     print('Number of classes : {}'.format(nb_classes))
-    
+    bcid = train_dataset.background_class_id
+
     stats_filename = os.path.join(out_folder, 'stats.csv')
     train_stats_filename = os.path.join(out_folder, 'train_stats.csv')
     model_filename = os.path.join(out_folder, 'model.th')
 
     if resume:
         model = torch.load(model_filename)
-
+        model = model.cuda()
         if os.path.exists(stats_filename):
             stats = pd.read_csv(stats_filename).to_dict(orient='list')
             first_epoch = max(stats['epoch']) + 1
         else:
             stats = defaultdict(list)
             first_epoch = 0
-
         if os.path.exists(train_stats_filename):
             train_stats = pd.read_csv(train_stats_filename).to_dict(orient='list')
         else:
             train_stats = defaultdict(list)
-
-        if not hasattr(model, 'nb_updates'):
-            model.nb_updates = 0
-
     else:
         model = SSD(
             num_anchors=list(map(len, aspect_ratios)), 
             num_classes=nb_classes)
+        model = model.cuda()
         model.transform = valid_transform
         model.nb_classes = nb_classes
         model.aspect_ratios = aspect_ratios
-        model.nb_values_per_anchor = nb_values_per_anchor
         model.anchor_list = anchor_list
         model.image_size = image_size
         first_epoch = 0
         stats = defaultdict(list)
         train_stats = defaultdict(list)
         model.nb_updates = 0
+        model.avg_loss = 0.
+        model.avg_loc = 0.
+        model.avg_classif = 0
+        model.background_class_id = train_dataset.background_class_id
 
-    model.class_name = train_dataset.class_name
+    model.class_to_idx = train_dataset.class_to_idx
     model.mean = mean
     model.std = std
     
-    class_weight = torch.zeros(nb_classes)
-    class_weight[0] = neg_weight
-    class_weight[1:] = pos_weight
-    class_weight = class_weight.cuda()
+    if imbalance_strategy == 'class_weight':
+        class_weight = torch.zeros(nb_classes)
+        class_weight[0] = neg_weight
+        class_weight[1:] = pos_weight
+        class_weight = class_weight.cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    step_size = len(train_dataset) // batch_size
-    scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
-    model = model.cuda()
-
-    avg_loss = 0.
-    avg_loc = 0.
-    avg_classif = 0.
+    #step_size = len(train_dataset) // batch_size
+    #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     for epoch in range(first_epoch, num_epoch):
         model.train()
         for batch, samples, in enumerate(train_loader):
@@ -195,9 +213,6 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             ct = class_true
             cp = class_pred
             nb_pos = m.long().sum()
-            #nb_examples = m.size(0)
-            #N = (nb_pos + 1) * (nb_examples)
-            #l_loc = ((m * smooth_l1_loss(bp, bt, size_average=False, reduce=False)) / N).sum()
             l_loc = smooth_l1_loss(bp[ind], bt[ind])
             if imbalance_strategy == 'hard_negative_mining':
                 # Hard negative mining
@@ -210,7 +225,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 cp_neg = cp[neg]
                 cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
                 vals, indices = cp_neg_loss.sort(descending=True)
-                nb = len(ct_pos) * 3
+                nb = len(ct_pos) * 3 # 3x more neg than pos as in the paper
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
                 l_classif = cross_entropy(cp_pos, ct_pos) + cross_entropy(cp_neg, ct_neg)
@@ -221,16 +236,10 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             model.zero_grad()
             loss = l_loc + lambda_ * l_classif
             loss.backward()
-            scheduler.batch_step()
             optimizer.step()
-            if avg_loss == 0.0:
-                avg_loss = loss.data[0]
-                avg_loc = l_loc.data[0]
-                avg_classif = l_classif.data[0]
-            else:
-                avg_loss = avg_loss * gamma + loss.data[0] * (1 - gamma)
-                avg_loc = avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
-                avg_classif = avg_classif * gamma + l_classif.data[0] * (1 - gamma)
+            model.avg_loss = model.avg_loss * gamma + loss.data[0] * (1 - gamma)
+            model.avg_loc = model.avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
+            model.avg_classif = model.avg_classif * gamma + l_classif.data[0] * (1 - gamma)
             delta = time.time() - t0
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
                   'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} AvgClassif {:.3f} Time:{:.3f}s'.format(
@@ -241,19 +250,19 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 loss.data[0], 
                 l_loc.data[0],
                 l_classif.data[0],
-                avg_loss,
-                avg_loc,
-                avg_classif,
+                model.avg_loss,
+                model.avg_loc,
+                model.avg_classif,
                 delta
                 ))
-            train_stats['avg_loss'].append(avg_loss)
             train_stats['loss'].append(loss.data[0])
-            train_stats['avg_loc'].append(avg_loc)
             train_stats['loc'].append(l_loc.data[0])
-            train_stats['avg_classif'].append(avg_classif)
             train_stats['classif'].append(l_classif.data[0])
+            train_stats['time'].append(delta)
 
             if model.nb_updates % 100 == 0:
+                # reporting part
+                # -- draw training samples with their predicted and true bounding boxes
                 pd.DataFrame(train_stats).to_csv(train_stats_filename, index=False)
                 t0 = time.time()
                 torch.save(model, model_filename)
@@ -265,15 +274,22 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 C = [torch.from_numpy(np.array(c)).long() for c in C]
                 M = [[m for b, c, m in y] for y in Y]
                 M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
- 
+                
+                # B contains groundtruth bounding boxes for each scale
+                # C contains groundtruth classes for each scale
+                # M contains the mask for each scale
+
                 BP = [
                     bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
                 CP = [
                     cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
- 
+                # BP contains predicted bounding boxes for each scale
+                # CP contains predicted classes for each scale
+
                 for i in range(len(X)):
+                    # for each example i in mini-batch
                     x = X[i]
                     x = x.transpose((1, 2, 0))
                     x = x * np.array(std) + np.array(mean)
@@ -281,24 +297,49 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                     gt_boxes = []
                     pred_boxes = []
                     for j in range(len(Y)):
+                        # for each scale j
                         ct = C[j][i]# class_id
                         cp = CP[j][i]#cl1_score,cl2_score,...
                         bt = B[j][i]#4
                         bp = BP[j][i]#4
                         A = model.anchor_list[j]
-                        boxes = decode_bounding_box_list(bt, ct, A, include_scores=False)
+                        # get groundtruth boxes
+                        boxes = decode_bounding_box_list(
+                            bt, ct, A, 
+                            background_class_id=bcid, 
+                            include_scores=False
+                        )
                         gt_boxes.extend(boxes)
-                        boxes = decode_bounding_box_list(bp, cp, A, include_scores=True)
+                        # get predicted boxes
+                        boxes = decode_bounding_box_list(
+                            bp, cp, A, 
+                            background_class_id=bcid, 
+                            include_scores=True
+                        )
                         pred_boxes.extend(boxes)
+                    # apply non-maximal suppression to predicted boxes
                     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
-                    gt_boxes = [(box, train_dataset.class_name[class_id]) for box, class_id in gt_boxes]
-                    pred_boxes = [(box, train_dataset.class_name[class_id]) for box, class_id in pred_boxes]
+                    # get class names
+                    gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
+                    pred_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in pred_boxes]
+                    # draw boxes
                     x = draw_bounding_boxes(x, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0))
                     x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
                     imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), x)
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
+            # LR schedule
+            if model.nb_updates <= 80000:
+                newlr = 0.001
+            elif model.nb_updates <= 100000:
+                newlr = 0.0001
+            else:
+                newlr = 0.00001
+            for g in optimizer.param_groups:
+                g['lr'] = newlr
+        if model.nb_updates % 100 != 0:
+            continue
         print('Evaluation') 
         t0 = time.time()
         model.eval()
@@ -314,14 +355,21 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 C = [torch.from_numpy(np.array(c)).long() for c in C]
                 M = [[m for b, c, m in y] for y in Y]
                 M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
- 
+                 
+                # B contains groundtruth bounding boxes for each scale
+                # C contains groundtruth classes for each scale
+                # M contains the mask for each scale
+
                 BP = [
                     bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
                 CP = [
                     cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
- 
+
+                # BP contains predicted bounding boxes for each scale
+                # CP contains predicted classes for each scale
+
                 for i in range(len(X)):
                     _, gt_boxes, _ = samples[i]
                     pred_boxes = []
@@ -329,7 +377,11 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                         cp = CP[j][i]#cl1_score,cl2_score,...
                         bp = BP[j][i]#4
                         A = model.anchor_list[j]
-                        boxes = decode_bounding_box_list(bp, cp, A, include_scores=True)
+                        boxes = decode_bounding_box_list(
+                            bp, cp, A, 
+                            background_class_id=train_dataset.background_class_id, 
+                            include_scores=True
+                        )
                         pred_boxes.extend(boxes)
                     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
                     prec = precision(pred_boxes, gt_boxes)
@@ -389,7 +441,10 @@ def _predict(model, samples):
     return X, (Y, Ypred), (bt, bp), (ct, cp), M
 
 
-def test(filename, *, model='out/model.th', out='out.png', cuda=False):
+def test(filename, *, model='out/model.th', out=None, cuda=False):
+    if not out:
+        path, ext = filename.split('.', 2)
+        out = path + '_out' + '.' + ext
     model = torch.load(model, map_location=lambda storage, loc: storage)
     if cuda:
         model = model.cuda()
@@ -424,16 +479,19 @@ def test(filename, *, model='out/model.th', out='out.png', cuda=False):
         cp = CP[j][0]#cl1_score,cl2_score,...
         bp = BP[j][0]#4
         A = model.anchor_list[j]
-        boxes = decode_bounding_box_list(bp, cp, A, include_scores=True)
+        boxes = decode_bounding_box_list(
+            bp, cp, A, 
+            background_class_id=model.background_class_id,
+            include_scores=True
+        )
         pred_boxes.extend(boxes)
-    pred_boxes = sorted(pred_boxes, key=lambda p:p[2], reverse=True)
-    #pred_boxes = [(box, class_id, score) for (box, class_id, score) in pred_boxes if score > 0.1]
     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
-    pred_boxes = [(box, model.class_name[class_id]) for box, class_id in pred_boxes]
+    pred_boxes = [(box, model.idx_to_class[class_id]) for box, class_id in pred_boxes]
     for box, name in pred_boxes:
         print(name)
     x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
     imsave(out, x)
+
 
 if __name__ == '__main__':
     run([train, test])
