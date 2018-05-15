@@ -109,13 +109,13 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         shuffle=True, 
         batch_size=batch_size, 
         collate_fn=clfn,
-        num_workers=8,
+        #num_workers=8,
     )
     valid_loader = DataLoader(
         valid_dataset, 
         batch_size=batch_size, 
         collate_fn=clfn,
-        num_workers=8,
+        #num_workers=8,
     )
 
     # Dataset and Loaders for evaluation
@@ -213,7 +213,12 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             ct = class_true
             cp = class_pred
             nb_pos = m.long().sum()
-            l_loc = smooth_l1_loss(bp[ind], bt[ind])
+            N = max(nb_pos.data[0], 1.0)
+            
+
+            # localization loss
+            l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
+            # classif loss
             if imbalance_strategy == 'hard_negative_mining':
                 # Hard negative mining
                 ind = torch.arange(len(ct))
@@ -228,11 +233,11 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 nb = len(ct_pos) * 3 # 3x more neg than pos as in the paper
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
-                l_classif = cross_entropy(cp_pos, ct_pos) + cross_entropy(cp_neg, ct_neg)
+                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'class_weight':
-                l_classif = cross_entropy(cp, ct, weight=class_weight)
+                l_classif = cross_entropy(cp, ct, weight=class_weight, size_average=False) / N
             elif imbalance_strategy == 'nothing':
-                l_classif = cross_entropy(cp, ct)
+                l_classif = cross_entropy(cp, ct, size_average=False) / N
             model.zero_grad()
             loss = l_loc + lambda_ * l_classif
             loss.backward()
@@ -242,19 +247,20 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             model.avg_classif = model.avg_classif * gamma + l_classif.data[0] * (1 - gamma)
             delta = time.time() - t0
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
-                  'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} AvgClassif {:.3f} Time:{:.3f}s'.format(
-                epoch,
-                num_epoch,
-                batch, 
-                len(train_loader), 
-                loss.data[0], 
-                l_loc.data[0],
-                l_classif.data[0],
-                model.avg_loss,
-                model.avg_loc,
-                model.avg_classif,
-                delta
-                ))
+                  'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} '
+                  'AvgClassif {:.3f} Time:{:.3f}s'.format(
+                      epoch,
+                      num_epoch,
+                      batch, 
+                      len(train_loader), 
+                      loss.data[0], 
+                      l_loc.data[0],
+                      l_classif.data[0],
+                      model.avg_loss,
+                      model.avg_loc,
+                      model.avg_classif,
+                      delta
+                    ))
             train_stats['loss'].append(loss.data[0])
             train_stats['loc'].append(l_loc.data[0])
             train_stats['classif'].append(l_classif.data[0])
