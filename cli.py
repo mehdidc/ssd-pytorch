@@ -26,8 +26,6 @@ from dataset import COCO
 from dataset import VOC
 from dataset import SubSample
 
-from util import draw_bounding_boxes
-from util import softmax
 from optim import CyclicLR
 
 import pyximport; pyximport.install()
@@ -37,35 +35,40 @@ from bounding_box import non_maximal_suppression_per_class
 from bounding_box import precision
 from bounding_box import recall
 from bounding_box import build_anchors
-
+from bounding_box import softmax
+from bounding_box import draw_bounding_boxes
 
 cudnn.benchmark = True
 
 
-def train(*, folder='coco', resume=False, out_folder='out'):
-    lambda_ = 1 # given to the classification loss relative to localization loss
-    batch_size = 16 
-    num_epoch = 100000
-    image_size = 300 
-    lr = 0.001
-    gamma = 0.9
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-    imbalance_strategy = 'hard_negative_mining'
+def train(*, config='config', resume=False):
+    cfg = {}
+    exec(open(config).read(), cfg, cfg)
+     
+    lambda_ = cfg['lambda_'] # given to the classification loss relative to localization loss
+    batch_size = cfg['batch_size']
+    num_epoch = cfg['num_epoch']
+    image_size = cfg['image_size']
+    lr = cfg['lr']
+    gamma = cfg['gamma']
+    mean = cfg['mean']
+    std = cfg['std']
+    dataset = cfg['dataset']
+    imbalance_strategy = cfg['imbalance_strategy']
+    out_folder = cfg['out_folder'] 
+    classes = cfg.get('classes')
     if imbalance_strategy == 'class_weight':
         pos_weight = 1
         neg_weight = 0.3
-    dataset = 'VOC'
-    # aspect ratios for each scale (we have 6 scales)
-    aspect_ratios = [
-        [1, 2, 3, 1/2, 1/3],
-        [1, 2, 3, 1/2, 1/3],
-        [1, 2, 3, 1/2, 1/3],
-        [1, 2, 3, 1/2, 1/3],
-        [1, 2, 3, 1/2, 1/3],
-        [1, 2, 3, 1/2, 1/3],
-    ]
+    nms_iou_threshold = cfg['nms_iou_threshold']
+    bbox_encoding_iou_threshold = cfg['bbox_encoding_iou_threshold']
+    aspect_ratios = cfg['aspect_ratios']
+    log_interval = 100
+    debug = True
+    if debug:
+        log_interval = 30
     # anchor list for each scale (we have 6 scales)
+    # (order is important)
     anchor_list = [
         build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
         build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
@@ -89,19 +92,49 @@ def train(*, folder='coco', resume=False, out_folder='out'):
     # dataset for train and valid
     print('Loading dataset anotations...')
     if dataset == 'COCO':
-        train_dataset = COCO('coco', anchor_list, split='train2014', transform=train_transform)
-        valid_dataset = COCO('coco', anchor_list, split='val2014', transform=valid_transform)
-    elif dataset == 'VOC':
-        train_dataset = VOC('voc', anchor_list, split='train', transform=train_transform)
-        valid_dataset = VOC('voc', anchor_list, split='val', transform=valid_transform)
+        train_dataset = COCO(
+            'data/coco', 
+            anchor_list, 
+            split='train2014',
+            iou_threshold=bbox_encoding_iou_threshold,
+            classes=classes,
+            transform=train_transform
+        )
+        valid_dataset = COCO(
+            'data/coco', 
+            anchor_list, 
+            split='val2014',
+            iou_threshold=bbox_encoding_iou_threshold,
+            classes=classes,
+            transform=valid_transform
+        )
+    elif dataset in ('VOC2007', 'VOC2012', 'VOC0712'):
+        train_dataset = VOC(
+            folder='data/voc',
+            anchor_list=anchor_list, 
+            which=dataset, 
+            split='train', 
+            iou_threshold=bbox_encoding_iou_threshold,
+            classes=classes,
+            transform=train_transform
+        )
+        valid_dataset = VOC(
+            folder='data/voc', 
+            anchor_list=anchor_list, 
+            which=dataset, 
+            split='val',
+            iou_threshold=bbox_encoding_iou_threshold,
+            classes=classes,
+            transform=valid_transform
+        )
     else:
-        raise ValueError('Unknown dataset')
+        raise ValueError('Unknown dataset {}'.format(dataset))
     print('Done loading dataset annotations.')
-    train_dataset = SubSample(train_dataset, nb=16)
-    valid_dataset = SubSample(valid_dataset, nb=16)
+    if debug:
+        train_dataset = SubSample(train_dataset, nb=2)
+        valid_dataset = SubSample(valid_dataset, nb=2)
     assert train_dataset.class_to_idx == valid_dataset.class_to_idx
     assert train_dataset.idx_to_class == valid_dataset.idx_to_class
-
     clfn = lambda l:l
     # Dataset loaders for full training and full validation 
     train_loader = DataLoader(
@@ -109,17 +142,15 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         shuffle=True, 
         batch_size=batch_size, 
         collate_fn=clfn,
-        #num_workers=8,
+        num_workers=cfg.get('num_workers', 8),
     )
     valid_loader = DataLoader(
         valid_dataset, 
         batch_size=batch_size, 
         collate_fn=clfn,
-        #num_workers=8,
+        num_workers=cfg.get('num_workers', 8),
     )
-
     # Dataset and Loaders for evaluation
-
     if len(train_dataset) > 1000:
         train_subset = SubSample(train_dataset, nb=1000)
         valid_subset = SubSample(valid_dataset, nb=1000)
@@ -180,11 +211,11 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         model.avg_loc = 0.
         model.avg_classif = 0
         model.background_class_id = train_dataset.background_class_id
+        model.class_to_idx = train_dataset.class_to_idx
+        model.mean = mean
+        model.std = std
+        print(model)
 
-    model.class_to_idx = train_dataset.class_to_idx
-    model.mean = mean
-    model.std = std
-    
     if imbalance_strategy == 'class_weight':
         class_weight = torch.zeros(nb_classes)
         class_weight[0] = neg_weight
@@ -192,7 +223,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
         class_weight = class_weight.cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    #step_size = len(train_dataset) // batch_size
+    step_size = len(train_dataset) // batch_size
     #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     for epoch in range(first_epoch, num_epoch):
         model.train()
@@ -214,8 +245,6 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             cp = class_pred
             nb_pos = m.long().sum()
             N = max(nb_pos.data[0], 1.0)
-            
-
             # localization loss
             l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
             # classif loss
@@ -241,6 +270,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             model.zero_grad()
             loss = l_loc + lambda_ * l_classif
             loss.backward()
+            #scheduler.batch_step()
             optimizer.step()
             model.avg_loss = model.avg_loss * gamma + loss.data[0] * (1 - gamma)
             model.avg_loc = model.avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
@@ -266,7 +296,7 @@ def train(*, folder='coco', resume=False, out_folder='out'):
             train_stats['classif'].append(l_classif.data[0])
             train_stats['time'].append(delta)
 
-            if model.nb_updates % 100 == 0:
+            if model.nb_updates % log_interval == 0:
                 # reporting part
                 # -- draw training samples with their predicted and true bounding boxes
                 pd.DataFrame(train_stats).to_csv(train_stats_filename, index=False)
@@ -310,19 +340,19 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                         bp = BP[j][i]#4
                         A = model.anchor_list[j]
                         # get groundtruth boxes
-                        boxes = decode_bounding_box_list(
+                        gt_boxes.extend(decode_bounding_box_list(
                             bt, ct, A, 
                             background_class_id=bcid, 
-                            include_scores=False
-                        )
-                        gt_boxes.extend(boxes)
+                            include_scores=False,
+                            image_size=image_size,
+                        ))
                         # get predicted boxes
-                        boxes = decode_bounding_box_list(
-                            bp, cp, A, 
+                        pred_boxes.extend(decode_bounding_box_list(
+                            bt, cp, A, 
                             background_class_id=bcid, 
-                            include_scores=True
-                        )
-                        pred_boxes.extend(boxes)
+                            include_scores=True,
+                            image_size=image_size,
+                        ))
                     # apply non-maximal suppression to predicted boxes
                     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
                     # get class names
@@ -336,15 +366,8 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
             # LR schedule
-            if model.nb_updates <= 80000:
-                newlr = 0.001
-            elif model.nb_updates <= 100000:
-                newlr = 0.0001
-            else:
-                newlr = 0.00001
-            for g in optimizer.param_groups:
-                g['lr'] = newlr
-        if model.nb_updates % 100 != 0:
+            _update_lr(optimizer, model.nb_updates)
+        if debug:
             continue
         print('Evaluation') 
         t0 = time.time()
@@ -377,19 +400,24 @@ def train(*, folder='coco', resume=False, out_folder='out'):
                 # CP contains predicted classes for each scale
 
                 for i in range(len(X)):
+                    # for each example i  in mini-batch
                     _, gt_boxes, _ = samples[i]
                     pred_boxes = []
                     for j in range(len(Y)):
+                        # for each scale j
                         cp = CP[j][i]#cl1_score,cl2_score,...
                         bp = BP[j][i]#4
                         A = model.anchor_list[j]
+                        # get predicted boxes
                         boxes = decode_bounding_box_list(
                             bp, cp, A, 
                             background_class_id=train_dataset.background_class_id, 
-                            include_scores=True
+                            include_scores=True,
+                            image_size=image_size,
                         )
                         pred_boxes.extend(boxes)
                     pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+                    # use the predicted boxes and groundtruth boxes to compute precision and recall
                     prec = precision(pred_boxes, gt_boxes)
                     re = recall(pred_boxes, gt_boxes)
                     metrics['precision_' + split_name].append(prec)
@@ -447,6 +475,18 @@ def _predict(model, samples):
     return X, (Y, Ypred), (bt, bp), (ct, cp), M
 
 
+def _update_lr(optimizer, nb_iter):
+    k = 1000
+    if nb_iter <= 80*k:
+        newlr = 0.001
+    elif nb_iter <= 100*k:
+        newlr = 0.0001
+    else:
+        newlr = 0.00001
+    for g in optimizer.param_groups:
+        g['lr'] = newlr
+
+
 def test(filename, *, model='out/model.th', out=None, cuda=False):
     if not out:
         path, ext = filename.split('.', 2)
@@ -474,7 +514,6 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
         permute(0, 3, 4, 1, 2).
         numpy() 
     for bp, cp in Ypred]
-
     X = X.data.cpu().numpy()
     x = X[0]
     x = x.transpose((1, 2, 0))
@@ -488,7 +527,8 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
         boxes = decode_bounding_box_list(
             bp, cp, A, 
             background_class_id=model.background_class_id,
-            include_scores=True
+            include_scores=True,
+            image_size=model.image_size,
         )
         pred_boxes.extend(boxes)
     pred_boxes = non_maximal_suppression_per_class(pred_boxes)

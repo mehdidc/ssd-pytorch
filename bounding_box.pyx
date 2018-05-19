@@ -8,47 +8,20 @@ from joblib import Memory
 from hashlib import md5
 import pandas as pd
 
-from util import softmax
-
 cimport numpy as np
 
 X, Y, W, H = 0, 1, 2, 3
 eps = 1e-10
 
-def build_anchors(image_size=300, scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
-    """
-    Builds a 4-order tensor that represents a set of anchors
-
-    Parameters
-    ----------
-
-    image_size : int
-        image size in pixels
-
-    scale : float between 0 and 1
-        scale of the bounding boxes relative to `image_size`
-
-    feature_map_size : int
-        size of the feature map (assumes width and height of feature maps are equal)
-
-    aspect_ratios : list of float
-        aspect ratios of bounding boxes to consider
-
-    Returns
-    -------
-
-    np.array of shape (feature_map_size, feature_map_size, nb, 4) where
-        - nb is len(aspect_ratios)
-        - we have 4 in the second order to represent x, y, w, h of each bounding box
-    """
+def build_anchors(scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
     A = np.empty((feature_map_size, feature_map_size, len(aspect_ratios), 4))
     for i in range(feature_map_size):
         for j in range(feature_map_size):
             for k, ar in enumerate(aspect_ratios):
-                x = image_size * ((k + 0.5) / feature_map_size)
-                y = image_size * ((j + 0.5) / feature_map_size)
-                w = image_size * (scale * np.sqrt(ar))
-                h = image_size * (scale / np.sqrt(ar))
+                x = (k + 0.5) / feature_map_size
+                y = (j + 0.5) / feature_map_size
+                w = (scale * np.sqrt(ar))
+                h = (scale / np.sqrt(ar))
                 A[i, j, k] = x, y, w, h
     return A
 
@@ -71,16 +44,16 @@ cpdef list encode_bounding_box_list_many_to_one(
         return E
     # For each groundtruth box, match the best anchor
     for j, (bbox, class_id) in enumerate(bbox_list):
+        best_iou = 0.
+        best_bbox = None
+        best_k = 0
+        best_ha = 0
+        best_wa = 0
+        best_scale = 0
         for i, anchors in enumerate(anchors_list):
             nbh = anchors.shape[0]
             nbw = anchors.shape[1]
             nbk = anchors.shape[2]
-            best_iou = 0.
-            best_bbox = None
-            best_k = 0
-            best_ha = 0
-            best_wa = 0
-            best_scale = 0
             for ha in range(nbh):
                 for wa in range(nbw):
                     for k in range(nbk):
@@ -94,15 +67,15 @@ cpdef list encode_bounding_box_list_many_to_one(
                         best_ha = ha
                         best_wa = wa
                         best_scale = i
-            ax, ay, aw, ah = best_bbox
-            bx, by, bw, bh = bbox
-            B, C, M = E[best_scale]
-            B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw) / variance[0]
-            B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah) / variance[1]
-            B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
-            B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
-            C[best_ha, best_wa, best_k] = class_id 
-            M[best_ha, best_wa, best_k] = True
+        ax, ay, aw, ah = best_bbox
+        bx, by, bw, bh = bbox
+        B, C, M = E[best_scale]
+        B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw) / variance[0]
+        B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah) / variance[1]
+        B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
+        B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
+        C[best_ha, best_wa, best_k] = class_id 
+        M[best_ha, best_wa, best_k] = True
     # match each anchor to the groundtruth box with best iou
     # if the best iou > iou_threshold
     for i, anchors in enumerate(anchors_list):
@@ -180,18 +153,7 @@ cpdef tuple encode_bounding_box_list_one_to_one(
     return B, C, M
 
 
-def decode_bounding_box_list(B, C, anchors, variance=[0.1, 0.1, 0.2, 0.2], background_class_id=0, include_scores=False):
-    """
-    Convert a 4-th order tensor of encoded bounding boxes into a list of
-    detected bounding boxes
-    
-    Parameters
-    ----------
-
-    E : n.array of shape (nb, 5, fh, fw)
-        - nb is the number of anchors per feature map position
-        - we have 5 numbers because each bounding box (4) + class_id
-    """
+def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 0.2, 0.2], background_class_id=0, include_scores=False):
     bbox_list = []
     for ha in range(anchors.shape[0]):
         for wa in range(anchors.shape[1]):
@@ -207,6 +169,7 @@ def decode_bounding_box_list(B, C, anchors, variance=[0.1, 0.1, 0.2, 0.2], backg
                 w = np.exp(bw) * aw
                 h = np.exp(bh) * ah
                 bbox = x, y, w, h
+                bbox = unnormalize_bounding_box(bbox, (image_size, image_size))
                 if include_scores is True:
                     scores = C[ha, wa, k]
                     scores = softmax(scores, axis=0)
@@ -219,6 +182,7 @@ def decode_bounding_box_list(B, C, anchors, variance=[0.1, 0.1, 0.2, 0.2], backg
                     if class_id != background_class_id: # not background
                         bbox_list.append((bbox, class_id))
     return bbox_list 
+
 
 def iou(bbox1, bbox2):
     """
@@ -237,7 +201,6 @@ def iou(bbox1, bbox2):
     """
     cdef float x, y, w, h, xx, yy, ww, hh
     cdef float winter, hinter
-
     bbox1 = uncenter_bounding_box(bbox1)
     bbox2 = uncenter_bounding_box(bbox2)
     x, y, w, h = bbox1
@@ -255,9 +218,59 @@ def iou(bbox1, bbox2):
 def uncenter_bounding_box(bbox):
     cdef float x, y, w, h
     x, y, w, h = bbox
+    return x - w / 2, y - h / 2, w, h
+
+
+def rescale_bounding_box(bbox, from_size, to_size):
+    cdef float x, y, w, h
+    x, y, w, h = bbox
+    x = (x / from_size[0]) * to_size[0]
+    y = (y / from_size[1]) * to_size[1]
+    w = (w / from_size[0]) * to_size[0]
+    h = (h / from_size[1]) * to_size[1]
+    return x, y, w, h
+
+
+def center_bounding_box(bbox):
+    cdef float x, y, w, h
+    x, y, w, h = bbox
+    x = x + w / 2
+    y = y + h / 2
+    return x, y, w, h
+
+
+def uncenter_bounding_box(bbox):
+    cdef float x, y, w, h
+    x, y, w, h = bbox
     x = x - w / 2
     y = y - h / 2
     return x, y, w, h
+
+
+def normalize_bounding_box(bbox, size):
+    cdef float x, y, w, h
+    x, y, w, h = bbox
+    x /= size[0]
+    w /= size[0]
+    y /= size[1]
+    h /= size[1]
+    return x, y, w, h
+
+
+def unnormalize_bounding_box(bbox, size):
+    cdef float x, y, w, h
+    x, y, w, h = bbox
+    x *= size[0]
+    w *= size[0]
+    y *= size[1]
+    h *= size[1]
+    return x, y, w, h
+
+
+def softmax(x, axis=1):
+    e_x = np.exp(x - x.max(axis=axis, keepdims=True))
+    return e_x / e_x.sum(axis=axis, keepdims=True) # only difference"
+
 
 def non_maximal_suppression_per_class(bbox_list, iou_threshold=0.5):
     classes = defaultdict(list)
@@ -305,7 +318,6 @@ def non_maximal_suppression(bbox_list, iou_threshold=0.5):
         final_bbox_list.append((bbox, class_id))
     return final_bbox_list
 
-
 def precision(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
         return 0
@@ -327,3 +339,35 @@ def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
             if iou(bt, bp) > iou_threshold and cp == ct:
                 M[i, j] = 1
     return M
+
+def draw_bounding_boxes(
+    source_image, 
+    bbox_list, 
+    color=[1.0, 1.0, 1.0], 
+    text_color=(1, 1, 1), 
+    font=cv2.FONT_HERSHEY_PLAIN, 
+    font_scale=1.0,
+    pad=30):
+    image = np.zeros((source_image.shape[0] + pad * 2, source_image.shape[1] + pad * 2, source_image.shape[2]))
+    image[pad:-pad, pad:-pad] = source_image
+    dx = pad
+    dy = pad
+    for bbox, class_name in bbox_list:
+        bbox = uncenter_bounding_box(bbox)
+        x, y, w, h = bbox
+        if x + dx > image.shape[1]:
+            continue
+        if x + dx + w > image.shape[1]:
+            continue
+        if y + dy > image.shape[0]:
+            continue
+        if y + dy + w > image.shape[1]:
+            continue
+        x = int(x) + dx
+        y = int(y) + dy
+        w = int(w)
+        h = int(h)
+        image = cv2.rectangle(image, (x, y), (x + w, y + h), color)
+        text = class_name
+        image = cv2.putText(image, text, (x, y), font, font_scale, text_color, 2, cv2.LINE_AA)
+    return image

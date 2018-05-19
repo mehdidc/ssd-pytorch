@@ -1,0 +1,17 @@
+dataset = 'COCO'
+lambda_ = 1 # coef of classification loss relative to localization loss
+batch_size = 16
+num_epoch = 100000 # total number of epochs
+image_size = 300 # image width and height
+lr = 0.001 # initial learning rate
+gamma = 0.9
+mean = [0.485, 0.456, 0.406]
+std = [0.229, 0.224, 0.225]
+imbalance_strategy = 'hard_negative_mining'
+out_folder = 'out'
+classes = ['bottle', 'cup', 'wine glass', 'bowl']
+bbox_encoding_iou_threshold = 0.5
+nms_iou_threshold = 0.45
+#ar = [1, 2, 3, 1/2, 1/3]
+ar = [0.43442604, 4.83296974, 1.63994908, 0.94056121, 9.57486505, 2.7237517]
+aspect_ratios = [ar] * 6

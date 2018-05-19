@@ -23,6 +23,31 @@ def list_image_sets():
         'tvmonitor']
 
 
+def imgs_from(dataset, root_dir):
+    """
+    Summary
+
+    Args:
+        cat_name (string): Category name as a string (from list_image_sets())
+        dataset (string): "train", "val", "train_val", or "test" (if available)
+
+    Returns:
+        pandas dataframe: pandas DataFrame of all filenames from that category
+    """
+    img_dir = os.path.join(root_dir, 'JPEGImages/')
+    ann_dir = os.path.join(root_dir, 'Annotations')
+    set_dir = os.path.join(root_dir, 'ImageSets', 'Main')
+    filename = os.path.join(set_dir, dataset + ".txt")
+    print(filename)
+    df = pd.read_csv(
+        filename,
+        delim_whitespace=True,
+        header=None,
+        dtype='str',
+        names=['filename', 'true'])
+    return df['filename'].values
+
+
 def imgs_from_category(cat_name, dataset, root_dir):
     """
     Summary
@@ -82,10 +107,13 @@ def load_annotation(img_filename, root_dir):
 
 
 # TODO: implement this
-def get_all_obj_and_box(img_set, root_dir):
+def get_all_obj_and_box_from_class(img_set, root_dir, classes=None):
+    if not classes:
+        classes = list_image_sets()
+    classes = set(classes)
     img_dir = os.path.join(root_dir, 'JPEGImages')
     obj_list = []
-    for objname in list_image_sets(): 
+    for objname in classes: 
         img_list = imgs_from_category(objname, img_set, root_dir)
         for img in img_list:
             anno = load_annotation(img, root_dir)
@@ -96,19 +124,50 @@ def get_all_obj_and_box(img_set, root_dir):
             for obj in objs:
                 obj_names = obj.findChildren('name')
                 for name_tag in obj_names:
-                    bbox = obj.findChildren('bndbox')[0]
-                    xmin = int(bbox.findChildren('xmin')[0].contents[0])
-                    ymin = int(bbox.findChildren('ymin')[0].contents[0])
-                    xmax = int(bbox.findChildren('xmax')[0].contents[0])
-                    ymax = int(bbox.findChildren('ymax')[0].contents[0])
-                    x, y = xmin, ymin
-                    w, h = xmax - xmin, ymax - ymin
-                    data.append(((x, y, w, h), name_tag.contents[0]))
+                    if name_tag.contents[0] in classes: 
+                        bbox = obj.findChildren('bndbox')[0]
+                        xmin = int(bbox.findChildren('xmin')[0].contents[0])
+                        ymin = int(bbox.findChildren('ymin')[0].contents[0])
+                        xmax = int(bbox.findChildren('xmax')[0].contents[0])
+                        ymax = int(bbox.findChildren('ymax')[0].contents[0])
+                        x, y = xmin, ymin
+                        w, h = xmax - xmin, ymax - ymin
+                        data.append(((x, y, w, h), name_tag.contents[0]))
             obj_list.append((fname, data))
     return obj_list
 
+def get_all_obj_and_box(img_set, root_dir, classes=None):
+    if classes:
+        classes = set(classes)
+    img_dir = os.path.join(root_dir, 'JPEGImages')
+    obj_list = []
+    img_list = imgs_from(img_set, root_dir)
+    for img in img_list:
+        anno = load_annotation(img, root_dir)
+        fname = anno.findChild('filename').contents[0]
+        fname = os.path.join(img_dir, fname)
+        objs = anno.findAll('object')
+        data = []
+        for obj in objs:
+            obj_names = obj.findChildren('name')
+            for name_tag in obj_names:
+                if classes and name_tag.contents[0] not in classes: 
+                    continue
+                bbox = obj.findChildren('bndbox')[0]
+                xmin = int(bbox.findChildren('xmin')[0].contents[0])
+                ymin = int(bbox.findChildren('ymin')[0].contents[0])
+                xmax = int(bbox.findChildren('xmax')[0].contents[0])
+                ymax = int(bbox.findChildren('ymax')[0].contents[0])
+                x, y = xmin, ymin
+                w, h = xmax - xmin, ymax - ymin
+                name = name_tag.contents[0].strip()
+                data.append(((x, y, w, h), name))
+        obj_list.append((fname, data))
+    return obj_list
+
+
 if __name__ == '__main__':
-    root_dir = '/home/mcherti/work/data/voc/VOCdevkit/VOC2012/'
+    root_dir = '/home/mcherti/work/data/sun/SUN2012pascalformat'
     for fname, bboxes in get_all_obj_and_box('train', root_dir):
-        for class_name, x, y, w, h in bboxes:
-            print(fname, x, y, w, h)
+        for (x, y, w, h), class_name in bboxes:
+            print(class_name, x, y, w, h)
