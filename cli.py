@@ -40,7 +40,6 @@ from bounding_box import draw_bounding_boxes
 
 cudnn.benchmark = True
 
-
 def train(*, config='config', resume=False):
     cfg = {}
     exec(open(config).read(), cfg, cfg)
@@ -64,7 +63,7 @@ def train(*, config='config', resume=False):
     bbox_encoding_iou_threshold = cfg['bbox_encoding_iou_threshold']
     aspect_ratios = cfg['aspect_ratios']
     log_interval = 100
-    debug = True
+    debug = False 
     if debug:
         log_interval = 30
     # anchor list for each scale (we have 6 scales)
@@ -97,6 +96,7 @@ def train(*, config='config', resume=False):
             anchor_list, 
             split='train2014',
             iou_threshold=bbox_encoding_iou_threshold,
+            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=train_transform
         )
@@ -105,6 +105,7 @@ def train(*, config='config', resume=False):
             anchor_list, 
             split='val2014',
             iou_threshold=bbox_encoding_iou_threshold,
+            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=valid_transform
         )
@@ -115,6 +116,7 @@ def train(*, config='config', resume=False):
             which=dataset, 
             split='train', 
             iou_threshold=bbox_encoding_iou_threshold,
+            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=train_transform
         )
@@ -124,6 +126,7 @@ def train(*, config='config', resume=False):
             which=dataset, 
             split='val',
             iou_threshold=bbox_encoding_iou_threshold,
+            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=valid_transform
         )
@@ -162,13 +165,13 @@ def train(*, config='config', resume=False):
         train_subset,
         batch_size=batch_size,
         collate_fn=clfn,
-        num_workers=8
+        num_workers=cfg.get('num_workers', 8)
     )
     valid_loader_subset = DataLoader(
         valid_subset,
         batch_size=batch_size,
         collate_fn=clfn,
-        num_workers=8
+        num_workers=cfg.get('num_workers', 8)
     )
     nb_classes = len(train_dataset.class_to_idx)
     print('Number of training images : {}'.format(len(train_dataset)))
@@ -310,11 +313,9 @@ def train(*, config='config', resume=False):
                 C = [torch.from_numpy(np.array(c)).long() for c in C]
                 M = [[m for b, c, m in y] for y in Y]
                 M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
-                
                 # B contains groundtruth bounding boxes for each scale
                 # C contains groundtruth classes for each scale
                 # M contains the mask for each scale
-
                 BP = [
                     bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
@@ -348,7 +349,7 @@ def train(*, config='config', resume=False):
                         ))
                         # get predicted boxes
                         pred_boxes.extend(decode_bounding_box_list(
-                            bt, cp, A, 
+                            bp, cp, A, 
                             background_class_id=bcid, 
                             include_scores=True,
                             image_size=image_size,
@@ -359,9 +360,12 @@ def train(*, config='config', resume=False):
                     gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
                     pred_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in pred_boxes]
                     # draw boxes
-                    x = draw_bounding_boxes(x, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0))
-                    x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
-                    imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), x)
+                    pad = 30
+                    im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+                    im[pad:-pad, pad:-pad] = x
+                    im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
+                    im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+                    imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), im)
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
@@ -535,7 +539,10 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
     pred_boxes = [(box, model.idx_to_class[class_id]) for box, class_id in pred_boxes]
     for box, name in pred_boxes:
         print(name)
-    x = draw_bounding_boxes(x, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0)) 
+    pad = 30
+    im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+    im[pad:-pad, pad:-pad] = x
+    im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
     imsave(out, x)
 
 

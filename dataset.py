@@ -1,3 +1,4 @@
+import random
 import torchvision.transforms as transforms
 import json
 from collections import defaultdict
@@ -14,7 +15,6 @@ from bounding_box import encode_bounding_box_list_one_to_one
 from bounding_box import rescale_bounding_box
 from bounding_box import center_bounding_box
 from bounding_box import normalize_bounding_box
-from bounding_box import decode_bounding_box_list
 from voc_utils import get_all_obj_and_box, list_image_sets
 
 class DetectionDataset(Dataset):
@@ -31,28 +31,36 @@ class DetectionDataset(Dataset):
         filename = self.filenames[i]
         boxes = self.boxes[i]
         x = default_loader(os.path.join(self.imgs_folder, 'img', filename))
-        # use the full image or randomly sample a patch
-        """
-        u = self.rng.uniform(0, 1)
-        if u <= 0.5:
-            scale = self.rng.uniform(0.3, 1.0)
-            ar = self.rng.uniform(0.5, 1.0)
+        # randomly sample a patch
+        
+        da_params = self.data_augmentation_params
+        if da_params is None:
+            da_params = {}
+        u = random.uniform(0, 1)
+        if u <= da_params.get('patch_proba', 0.5):
+            min_scale = da_params.get('min_scale', 0.1)
+            max_scale = da_params.get('max_scale', 1)
+            min_ar = da_params.get('min_aspect_ratio', 0.5)
+            max_ar = da_params.get('max_aspect_ratio', 2)
+            max_nb_trials = da_params.get('nb_trials', 50)
+            scale = random.uniform(min_scale, max_scale)
+            ar = random.uniform(min_ar, max_ar)
             boxes_ = []
-            while len(boxes_) == 0:
+            nb_trials = 0
+            while len(boxes_) == 0 and nb_trials < max_nb_trials:
                 x_, crop_box = _random_patch(self.rng, x, scale, ar)
                 boxes_ = [(box, cat) for box, cat in boxes if box_in_box(box, crop_box)]
                 bx, by, bw, bh = crop_box
                 boxes_ = [((x - bx, y - by, w, h), cat) for (x, y, w, h), cat in boxes_]
-            boxes = boxes_
-            x = x_
-        """
+                nb_trials += 1
+            if len(boxes_) > 0:
+                boxes = boxes_
+                x = x_
         # flip
-        """
-        u = self.rng.uniform(0, 1)
-        if u <= 0.5:
+        u = random.uniform(0, 1)
+        if u <= da_params.get('flip_proba', 0.5):
             x = x.transpose(PIL.Image.FLIP_LEFT_RIGHT)
             boxes = [((x.size[0] - bx - bw, by, bw, bh), cat) for (bx, by, bw, bh), cat in boxes] 
-        """
         # apply transform
         from_size = x.size
         x = self.transform(x)
@@ -71,18 +79,20 @@ class DetectionDataset(Dataset):
         return len(self.boxes)
 
 
-
 class COCO(DetectionDataset):
-    def __init__(self, folder, anchor_list, split='train2014', iou_threshold=0.5, classes=None, transform=None, random_state=42):
+    def __init__(self, folder, anchor_list, 
+                 split='train2014', iou_threshold=0.5, 
+                 data_augmentation_params=None,
+                 classes=None, transform=None, random_state=42):
         self.imgs_folder = os.path.join(folder, split)
         self.anchor_list = anchor_list
         self.annotations_folder = os.path.join(folder, 'annotations')
         self.split = split
         self.transform = transform
         self.classes = classes
-        self.bbox_encodings = {}
         self.background_class_id = 0
         self.iou_threshold = iou_threshold
+        self.data_augmentation_params = data_augmentation_params
         self.rng = np.random.RandomState(random_state)
         self._load_annotations()
     
@@ -130,7 +140,11 @@ class COCO(DetectionDataset):
     
 
 class VOC(DetectionDataset):
-    def __init__(self, folder, anchor_list, which='VOC2007', split='train', iou_threshold=0.5, classes=None, transform=None, random_state=42):
+    def __init__(self, folder, anchor_list, 
+                 which='VOC2007', split='train', 
+                 iou_threshold=0.5, data_augmentation_params=None, 
+                 classes=None, transform=None, 
+                 random_state=42):
         self.folder = folder # root folder, should contain VOC2007 and/or VOC2012
         self.which = which
         self.anchor_list = anchor_list
@@ -139,6 +153,7 @@ class VOC(DetectionDataset):
         self.background_class_id = 0
         self.classes = classes
         self.iou_threshold = iou_threshold
+        self.data_augmentation_params = data_augmentation_params
         self.rng = np.random.RandomState(random_state)
         self._load_annotations()
 

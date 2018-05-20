@@ -318,6 +318,7 @@ def non_maximal_suppression(bbox_list, iou_threshold=0.5):
         final_bbox_list.append((bbox, class_id))
     return final_bbox_list
 
+
 def precision(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
         return 0
@@ -341,30 +342,26 @@ def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     return M
 
 def draw_bounding_boxes(
-    source_image, 
+    image,
     bbox_list, 
     color=[1.0, 1.0, 1.0], 
     text_color=(1, 1, 1), 
     font=cv2.FONT_HERSHEY_PLAIN, 
     font_scale=1.0,
-    pad=30):
-    image = np.zeros((source_image.shape[0] + pad * 2, source_image.shape[1] + pad * 2, source_image.shape[2]))
-    image[pad:-pad, pad:-pad] = source_image
-    dx = pad
-    dy = pad
+    pad=0):
     for bbox, class_name in bbox_list:
         bbox = uncenter_bounding_box(bbox)
         x, y, w, h = bbox
-        if x + dx > image.shape[1]:
+        if x + pad > image.shape[1]:
             continue
-        if x + dx + w > image.shape[1]:
+        if x + pad + w > image.shape[1]:
             continue
-        if y + dy > image.shape[0]:
+        if y + pad > image.shape[0]:
             continue
-        if y + dy + w > image.shape[1]:
+        if y + pad + w > image.shape[1]:
             continue
-        x = int(x) + dx
-        y = int(y) + dy
+        x = int(x) + pad
+        y = int(y) + pad
         w = int(w)
         h = int(h)
         image = cv2.rectangle(image, (x, y), (x + w, y + h), color)
