@@ -30,14 +30,13 @@ from optim import CyclicLR
 
 import pyximport; pyximport.install()
 from bounding_box import decode_bounding_box_list
-from bounding_box import non_maximal_suppression
 from bounding_box import non_maximal_suppression_per_class
 from bounding_box import precision
 from bounding_box import recall
 from bounding_box import build_anchors
 from bounding_box import softmax
 from bounding_box import draw_bounding_boxes
-
+from bounding_box import average_precision
 cudnn.benchmark = True
 
 def train(*, config='config', resume=False):
@@ -61,20 +60,25 @@ def train(*, config='config', resume=False):
         neg_weight = 0.3
     nms_iou_threshold = cfg['nms_iou_threshold']
     bbox_encoding_iou_threshold = cfg['bbox_encoding_iou_threshold']
+    eval_iou_threshold = cfg['eval_iou_threshold']
     aspect_ratios = cfg['aspect_ratios']
-    log_interval = 100
+    log_interval = cfg.get('log_interval', 100)
+    eval_topk = cfg['eval_topk'] 
+    score_threshold = cfg['score_threshold']
+
     debug = False 
     if debug:
         log_interval = 30
     # anchor list for each scale (we have 6 scales)
     # (order is important)
+    scales = cfg['scales']
     anchor_list = [
-        build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
-        build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
-        build_anchors(scale=0.48, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
-        build_anchors(scale=0.62, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
-        build_anchors(scale=0.76, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
-        build_anchors(scale=0.90, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
+        build_anchors(scale=scales[0], feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
+        build_anchors(scale=scales[1], feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
+        build_anchors(scale=scales[2], feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
+        build_anchors(scale=scales[3], feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
+        build_anchors(scale=scales[4], feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
+        build_anchors(scale=scales[5], feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
     ]
     # transforms
     normalize = transforms.Normalize(mean=mean, std=std)
@@ -91,51 +95,72 @@ def train(*, config='config', resume=False):
     # dataset for train and valid
     print('Loading dataset anotations...')
     if dataset == 'COCO':
-        train_dataset = COCO(
-            'data/coco', 
-            anchor_list, 
-            split='train2014',
+        train_split = 'train' + str(cfg['dataset_version'])
+        val_split = 'val' + str(cfg['dataset_version'])
+        kwargs = dict(
+            folder=cfg['dataset_root_folder'],
+            anchor_list=anchor_list,
             iou_threshold=bbox_encoding_iou_threshold,
-            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=train_transform
+        )
+        train_dataset = COCO(
+            split=train_split,
+            data_augmentation_params=cfg['data_augmentation_params'],
+            **kwargs
         )
         valid_dataset = COCO(
-            'data/coco', 
-            anchor_list, 
-            split='val2014',
-            iou_threshold=bbox_encoding_iou_threshold,
-            data_augmentation_params=cfg['data_augmentation_params'],
-            classes=classes,
-            transform=valid_transform
+            split=val_split,
+            data_augmentation_params={},
+            **kwargs,
         )
-    elif dataset in ('VOC2007', 'VOC2012', 'VOC0712'):
-        train_dataset = VOC(
-            folder='data/voc',
+        train_evaluation = SubSample(COCO(
+            split=train_split,
+            data_augmentation_params={},
+            **kwargs,
+        ), nb=cfg['train_evaluation_size'])
+        valid_evaluation = SubSample(
+            valid_dataset, 
+            nb=cfg['val_evaluation_size']
+        )
+    elif dataset == 'VOC':
+        kwargs = dict(
+            folder=cfg['dataset_root_folder'],
             anchor_list=anchor_list, 
-            which=dataset, 
+            which=cfg['dataset_version'], 
             split='train', 
             iou_threshold=bbox_encoding_iou_threshold,
-            data_augmentation_params=cfg['data_augmentation_params'],
             classes=classes,
             transform=train_transform
         )
-        valid_dataset = VOC(
-            folder='data/voc', 
-            anchor_list=anchor_list, 
-            which=dataset, 
-            split='val',
-            iou_threshold=bbox_encoding_iou_threshold,
+        train_dataset = VOC(
+            split='train',
             data_augmentation_params=cfg['data_augmentation_params'],
-            classes=classes,
-            transform=valid_transform
+            **kwargs,
+        )
+        valid_dataset = VOC(
+            split='val',
+            data_augmentation_params={},
+            **kwargs,
+        )
+        train_evaluation = SubSample(VOC(
+            split='train',
+            data_augmentation_params={},
+            **kwargs
+        ), nb=cfg['train_evaluation_size'])
+        valid_evaluation = SubSample(
+            valid_dataset, 
+            nb=cfg['val_evaluation_size']
         )
     else:
         raise ValueError('Unknown dataset {}'.format(dataset))
     print('Done loading dataset annotations.')
     if debug:
-        train_dataset = SubSample(train_dataset, nb=2)
-        valid_dataset = SubSample(valid_dataset, nb=2)
+        n = 2
+        train_dataset = SubSample(train_dataset, nb=n)
+        valid_dataset = SubSample(valid_dataset, nb=n)
+        train_evaluation = SubSample(train_evaluation, nb=n)
+        valid_evaluation = SubSample(valid_evaluation, nb=n)
     assert train_dataset.class_to_idx == valid_dataset.class_to_idx
     assert train_dataset.idx_to_class == valid_dataset.idx_to_class
     clfn = lambda l:l
@@ -153,32 +178,23 @@ def train(*, config='config', resume=False):
         collate_fn=clfn,
         num_workers=cfg.get('num_workers', 8),
     )
-    # Dataset and Loaders for evaluation
-    if len(train_dataset) > 1000:
-        train_subset = SubSample(train_dataset, nb=1000)
-        valid_subset = SubSample(valid_dataset, nb=1000)
-    else:
-        train_subset = train_dataset
-        valid_subset = valid_dataset
-
-    train_loader_subset = DataLoader(
-        train_subset,
+    train_evaluation_loader = DataLoader(
+        train_evaluation,
         batch_size=batch_size,
         collate_fn=clfn,
         num_workers=cfg.get('num_workers', 8)
     )
-    valid_loader_subset = DataLoader(
-        valid_subset,
+    valid_evaluation_loader = DataLoader(
+        valid_evaluation,
         batch_size=batch_size,
         collate_fn=clfn,
         num_workers=cfg.get('num_workers', 8)
     )
     nb_classes = len(train_dataset.class_to_idx)
+    bgid = train_dataset.class_to_idx['background']
     print('Number of training images : {}'.format(len(train_dataset)))
     print('Number of valid images : {}'.format(len(valid_dataset)))
     print('Number of classes : {}'.format(nb_classes))
-    bcid = train_dataset.background_class_id
-
     stats_filename = os.path.join(out_folder, 'stats.csv')
     train_stats_filename = os.path.join(out_folder, 'train_stats.csv')
     model_filename = os.path.join(out_folder, 'model.th')
@@ -229,6 +245,7 @@ def train(*, config='config', resume=False):
     step_size = len(train_dataset) // batch_size
     #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     for epoch in range(first_epoch, num_epoch):
+        epoch_t0 = time.time()
         model.train()
         for batch, samples, in enumerate(train_loader):
             t0 = time.time()
@@ -282,9 +299,9 @@ def train(*, config='config', resume=False):
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
                   'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} '
                   'AvgClassif {:.3f} Time:{:.3f}s'.format(
-                      epoch,
+                      epoch + 1,
                       num_epoch,
-                      batch, 
+                      batch + 1, 
                       len(train_loader), 
                       loss.data[0], 
                       l_loc.data[0],
@@ -343,19 +360,19 @@ def train(*, config='config', resume=False):
                         # get groundtruth boxes
                         gt_boxes.extend(decode_bounding_box_list(
                             bt, ct, A, 
-                            background_class_id=bcid, 
                             include_scores=False,
                             image_size=image_size,
                         ))
                         # get predicted boxes
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
-                            background_class_id=bcid, 
                             include_scores=True,
                             image_size=image_size,
                         ))
+                    gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # apply non-maximal suppression to predicted boxes
-                    pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+                    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
+                    pred_boxes = [(box, class_id) for box, class_id in pred_boxes if class_id != bgid]
                     # get class names
                     gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
                     pred_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in pred_boxes]
@@ -370,14 +387,16 @@ def train(*, config='config', resume=False):
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
             # LR schedule
-            _update_lr(optimizer, model.nb_updates)
-        if debug:
+            _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
+        if debug and model.nb_updates % 50 != 0:
             continue
+        epoch_time = time.time() - epoch_t0
         print('Evaluation') 
         t0 = time.time()
         model.eval()
         metrics = defaultdict(list)
-        for split_name, loader in (('train', train_loader_subset), ('valid', valid_loader_subset)):
+        metrics['train_time'] = [epoch_time]
+        for split_name, loader in (('train', train_evaluation_loader), ('valid', valid_evaluation_loader)):
             t0 = time.time()
             for batch, samples, in enumerate(loader):
                 tt0 = time.time()
@@ -405,32 +424,60 @@ def train(*, config='config', resume=False):
 
                 for i in range(len(X)):
                     # for each example i  in mini-batch
-                    _, gt_boxes, _ = samples[i]
+                    gt_boxes = []
                     pred_boxes = []
                     for j in range(len(Y)):
                         # for each scale j
+                        ct = C[j][i]# class_id
                         cp = CP[j][i]#cl1_score,cl2_score,...
+                        bt = B[j][i]#4
                         bp = BP[j][i]#4
                         A = model.anchor_list[j]
+                        # get groundtruth boxes
+                        gt_boxes.extend(decode_bounding_box_list(
+                            bt, ct, A, 
+                            include_scores=False,
+                            image_size=image_size,
+                        ))
                         # get predicted boxes
-                        boxes = decode_bounding_box_list(
+                        pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
-                            background_class_id=train_dataset.background_class_id, 
                             include_scores=True,
                             image_size=image_size,
-                        )
-                        pred_boxes.extend(boxes)
-                    pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+                        ))
+                    gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
+                    # mAP
+                    mAP = []
+                    for class_id in model.class_to_idx.values():
+                        if class_id == bgid:
+                            continue
+                        AP = average_precision(pred_boxes, gt_boxes, class_id, topk=eval_topk, iou_threshold=eval_iou_threshold)
+                        if AP is not None:
+                            mAP.append(AP)
+                    mAP = np.mean(mAP)
+                    metrics['mAP_' + split_name].append(mAP)
                     # use the predicted boxes and groundtruth boxes to compute precision and recall
-                    prec = precision(pred_boxes, gt_boxes)
-                    re = recall(pred_boxes, gt_boxes)
-                    metrics['precision_' + split_name].append(prec)
-                    metrics['recall_' + split_name].append(re)
+                    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
+                    P = []
+                    R = []
+                    for class_id in model.class_to_idx.values():
+                        if class_id == bgid:
+                            continue
+                        t = [box for box, cl in gt_boxes if cl == class_id]
+                        if len(t) == 0:
+                            continue
+                        p = [box for box, cl in pred_boxes if cl == class_id]
+                        prec = precision(p, t, iou_threshold=eval_iou_threshold)
+                        re = recall(p, t, iou_threshold=eval_iou_threshold)
+                        P.append(prec)
+                        R.append(re)
+                    metrics['precision_' + split_name].append(np.mean(P))
+                    metrics['recall_' + split_name].append(np.mean(R))
                 delta = time.time() - tt0
                 print('Eval Batch {:04d}/{:04d} on split {} Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
             delta = time.time() - t0
+            metrics['eval_' + split_name + '_time'] = [delta]
             print('Eval time of {}: {:.4f}s'.format(split_name, delta))
-
         for k in sorted(metrics.keys()):
             v = np.mean(metrics[k])
             print('{}: {:.4}'.format(k, v))
@@ -479,16 +526,16 @@ def _predict(model, samples):
     return X, (Y, Ypred), (bt, bp), (ct, cp), M
 
 
-def _update_lr(optimizer, nb_iter):
-    k = 1000
-    if nb_iter <= 80*k:
-        newlr = 0.001
-    elif nb_iter <= 100*k:
-        newlr = 0.0001
-    else:
-        newlr = 0.00001
+def _update_lr(optimizer, nb_iter, schedule):
+    for sc in schedule:
+        (start_iter, end_iter), new_lr = sc['iter'], sc['lr']
+        if start_iter <= nb_iter  <= end_iter:
+            break
+    old_lr = optimizer.param_groups[0]['lr']
+    if old_lr != new_lr:
+        print('Chaning LR from {:.5f} to {:.5f}'.format(old_lr, new_lr))
     for g in optimizer.param_groups:
-        g['lr'] = newlr
+        g['lr'] = new_lr
 
 
 def test(filename, *, model='out/model.th', out=None, cuda=False):
@@ -530,12 +577,13 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
         A = model.anchor_list[j]
         boxes = decode_bounding_box_list(
             bp, cp, A, 
-            background_class_id=model.background_class_id,
-            include_scores=True,
             image_size=model.image_size,
+            include_scores=True,
         )
         pred_boxes.extend(boxes)
-    pred_boxes = non_maximal_suppression_per_class(pred_boxes)
+    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
+    bgid = model.class_to_idx['background']
+    pred_boxes = [(box, class_id) for box, class_id in pred_boxes if class_id != bgid]
     pred_boxes = [(box, model.idx_to_class[class_id]) for box, class_id in pred_boxes]
     for box, name in pred_boxes:
         print(name)

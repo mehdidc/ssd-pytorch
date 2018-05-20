@@ -153,7 +153,7 @@ cpdef tuple encode_bounding_box_list_one_to_one(
     return B, C, M
 
 
-def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 0.2, 0.2], background_class_id=0, include_scores=False):
+def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 0.2, 0.2], include_scores=False):
     bbox_list = []
     for ha in range(anchors.shape[0]):
         for wa in range(anchors.shape[1]):
@@ -173,14 +173,11 @@ def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 
                 if include_scores is True:
                     scores = C[ha, wa, k]
                     scores = softmax(scores, axis=0)
-                    class_id = scores.argmax()
-                    score = scores[class_id]
-                    if class_id != background_class_id: # not background
-                        bbox_list.append((bbox, class_id, score))
+                    class_id = np.argmax(scores)
+                    bbox_list.append((bbox, scores))
                 else:
                     class_id = C[ha, wa, k]
-                    if class_id != background_class_id: # not background
-                        bbox_list.append((bbox, class_id))
+                    bbox_list.append((bbox, class_id))
     return bbox_list 
 
 
@@ -272,50 +269,38 @@ def softmax(x, axis=1):
     return e_x / e_x.sum(axis=axis, keepdims=True) # only difference"
 
 
-def non_maximal_suppression_per_class(bbox_list, iou_threshold=0.5):
-    classes = defaultdict(list)
-    for bbox, class_id, score in bbox_list:
-        classes[class_id].append((bbox, class_id, score))
+def non_maximal_suppression_per_class(bbox_list, iou_threshold=0.5, score_threshold=0.0):
+    bb_scores = bbox_list[0]
+    bb, scores = bb_scores
+    nb_classes = len(scores)
     bblist_all = []
-    for cl, bblist in classes.items():
-        bblist = non_maximal_suppression(bblist, iou_threshold=iou_threshold)
-        bblist_all.extend(bblist)
+    for cl in range(nb_classes):
+        bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] > score_threshold]
+        bb = non_maximal_suppression(bb, iou_threshold=iou_threshold)
+        bb = [(b, cl) for b in bb]
+        bblist_all.extend(bb)
     return bblist_all
 
 
 def non_maximal_suppression(bbox_list, iou_threshold=0.5):
-    """
-    
-    Parameters
-    ----------
-    
-    bbox_list : list of 3-tuples (bbox, class_id, score)
-        where bbox is a 4-tuple (x, y, w, h),
-        class_id is the class with the max score
-        score is the non-background (objectness) score
-    iou_threshold : float
-
-    Returns
-    -------
-
-    list of 2-tuples (bbox, class_id)
-    """
     L = set(bbox_list)
-    score = lambda b:b[2]
+    def score_fn(k):
+        bbox, score = k
+        return score
     final_bbox_list = []
     f = []
     while len(L) > 0:
-        cur = max(L, key=score)
-        bbox, class_id, _ = cur
+        cur = max(L, key=score_fn)
+        bbox, score = cur
         remove = [cur]
         for l in L:
-            bbox_, _, _ = l
+            bbox_, _ = l
             if iou(bbox, bbox_) > iou_threshold:
                 remove.append(l)
         remove = set(remove)
         for r in remove:
             L.remove(r)
-        final_bbox_list.append((bbox, class_id))
+        final_bbox_list.append(bbox) 
     return final_bbox_list
 
 
@@ -333,13 +318,58 @@ def recall(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     return (M.sum(axis=1) > 0).astype('float32').mean()
 
 
+def average_precision(
+    bbox_pred_list_with_scores, bbox_true_list, 
+    class_id,
+    recalls_mAP=np.linspace(0, 1, 11),
+    iou_threshold=0.5,
+    topk=100):
+    # https://medium.com/@jonathan_hui/map-mean-average-precision-for-object-detection-45c121a31173
+    def score_fn(k):
+        bbox, scores = k
+        score = scores[class_id]
+        return score
+    bbox_pred_list_with_scores = sorted(bbox_pred_list_with_scores, key=score_fn, reverse=True)
+    precisions = []
+    recalls = []
+    tb = [bbox for bbox, cl in bbox_true_list if cl == class_id]
+    if len(tb) == 0:
+        return
+    for i in range(min(len(bbox_pred_list_with_scores), topk)):
+        # precision and recall with top-i scores
+        pb = bbox_pred_list_with_scores[0:i + 1]
+        pb = [bbox for bbox, scores in pb]
+        prec = precision(pb, tb, iou_threshold=iou_threshold)
+        re = recall(pb, tb, iou_threshold=iou_threshold)
+        precisions.append(prec)
+        recalls.append(re)
+    vals = []
+    for r in recalls_mAP:
+       val = max((precisions[i] for i in range(len(precisions)) if recalls[i] >= r), default=0)
+       vals.append(val)
+    return np.mean(vals)
+
+
 def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     M = np.zeros((len(bbox_pred_list), len(bbox_true_list)))
-    for i, (bp, cp) in enumerate(bbox_pred_list):
-        for j, (bt, ct) in enumerate(bbox_true_list):
-            if iou(bt, bp) > iou_threshold and cp == ct:
+    for i, bp in enumerate(bbox_pred_list):
+        for j, bt in enumerate(bbox_true_list):
+            if iou(bt, bp) > iou_threshold:
                 M[i, j] = 1
     return M
+
+
+def box_in_box(box_small, box_big):
+    cdef float bsx, bsy, bsw, bsh
+    cdef float bbx, bby, bbw, bbh
+    bsx, bsy, bsw, bsh = box_small
+    bbx, bby, bbw, bbh = box_big
+    if not (bsx >= bbx and bsx + bsw <= bbx + bbw):
+        return False
+    if not (bsy >= bby and bsy + bsh <= bby + bbh):
+        return False
+    return True
+
 
 def draw_bounding_boxes(
     image,
@@ -352,18 +382,18 @@ def draw_bounding_boxes(
     for bbox, class_name in bbox_list:
         bbox = uncenter_bounding_box(bbox)
         x, y, w, h = bbox
-        if x + pad > image.shape[1]:
-            continue
-        if x + pad + w > image.shape[1]:
-            continue
-        if y + pad > image.shape[0]:
-            continue
-        if y + pad + w > image.shape[1]:
-            continue
         x = int(x) + pad
         y = int(y) + pad
         w = int(w)
         h = int(h)
+        if x > image.shape[1]:
+            continue
+        if x + w > image.shape[1]:
+            continue
+        if y > image.shape[0]:
+            continue
+        if y + h > image.shape[1]:
+            continue
         image = cv2.rectangle(image, (x, y), (x + w, y + h), color)
         text = class_name
         image = cv2.putText(image, text, (x, y), font, font_scale, text_color, 2, cv2.LINE_AA)

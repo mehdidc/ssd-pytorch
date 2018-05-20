@@ -15,7 +15,8 @@ from bounding_box import encode_bounding_box_list_one_to_one
 from bounding_box import rescale_bounding_box
 from bounding_box import center_bounding_box
 from bounding_box import normalize_bounding_box
-from voc_utils import get_all_obj_and_box, list_image_sets
+from bounding_box import box_in_box
+from voc_utils import get_all_obj_and_box
 
 class DetectionDataset(Dataset):
 
@@ -30,6 +31,8 @@ class DetectionDataset(Dataset):
     def _load(self, i):
         filename = self.filenames[i]
         boxes = self.boxes[i]
+        assert len(boxes) > 0, i
+
         x = default_loader(os.path.join(self.imgs_folder, 'img', filename))
         # randomly sample a patch
         
@@ -37,7 +40,7 @@ class DetectionDataset(Dataset):
         if da_params is None:
             da_params = {}
         u = random.uniform(0, 1)
-        if u <= da_params.get('patch_proba', 0.5):
+        if u <= da_params.get('patch_proba', 0):
             min_scale = da_params.get('min_scale', 0.1)
             max_scale = da_params.get('max_scale', 1)
             min_ar = da_params.get('min_aspect_ratio', 0.5)
@@ -56,9 +59,10 @@ class DetectionDataset(Dataset):
             if len(boxes_) > 0:
                 boxes = boxes_
                 x = x_
+        assert len(boxes) > 0, i
         # flip
         u = random.uniform(0, 1)
-        if u <= da_params.get('flip_proba', 0.5):
+        if u <= da_params.get('flip_proba', 0):
             x = x.transpose(PIL.Image.FLIP_LEFT_RIGHT)
             boxes = [((x.size[0] - bx - bw, by, bw, bh), cat) for (bx, by, bw, bh), cat in boxes] 
         # apply transform
@@ -80,7 +84,7 @@ class DetectionDataset(Dataset):
 
 
 class COCO(DetectionDataset):
-    def __init__(self, folder, anchor_list, 
+    def __init__(self, folder='data/coco', anchor_list=[], 
                  split='train2014', iou_threshold=0.5, 
                  data_augmentation_params=None,
                  classes=None, transform=None, random_state=42):
@@ -137,10 +141,10 @@ class COCO(DetectionDataset):
         indexes = list(index_to_filename.keys())
         self.boxes = [B[ind] for ind in indexes if len(B[ind]) > 0]
         self.filenames = [index_to_filename[ind] for ind in indexes if len(B[ind]) > 0]
-    
+
 
 class VOC(DetectionDataset):
-    def __init__(self, folder, anchor_list, 
+    def __init__(self, folder='data/voc', anchor_list=[], 
                  which='VOC2007', split='train', 
                  iou_threshold=0.5, data_augmentation_params=None, 
                  classes=None, transform=None, 
@@ -187,16 +191,6 @@ class VOC(DetectionDataset):
         self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
 
 
-def box_in_box(box_small, box_big):
-    bsx, bsy, bsw, bsh = box_small
-    bbx, bby, bbw, bbh = box_big
-    if not (bsx >= bbx and bsx + bsw <= bbx + bbw):
-        return False
-    if not (bsy >= bby and bsy + bsh <= bby + bbh):
-        return False
-    return True
-
-
 def _random_patch(rng, im, scale, aspect_ratio):
     w, h = im.size
     wcrop = int(scale * w)
@@ -210,6 +204,7 @@ def _random_patch(rng, im, scale, aspect_ratio):
 class SubSample:
 
     def __init__(self, dataset, nb):
+        nb = min(len(dataset), nb)
         self.dataset = dataset
         self.nb = nb
         self.classes = dataset.classes
