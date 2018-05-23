@@ -1,24 +1,17 @@
 import time
-import sys
 import os
 import numpy as np
 from collections import defaultdict
 from clize import run
-import json
 from skimage.io import imsave
 import pandas as pd
-from joblib import Parallel, delayed
 
 import torchvision.transforms as transforms
-import torch.nn as nn
 import torch
-import torchvision.models as models
 from torch.utils.data import DataLoader
-import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
-from torch.nn.functional import smooth_l1_loss, mse_loss, cross_entropy
-from torchvision import models
+from torch.nn.functional import smooth_l1_loss, cross_entropy
 from model import SSD
 from torchvision.datasets.folder import default_loader
 
@@ -26,7 +19,6 @@ from dataset import COCO
 from dataset import VOC
 from dataset import SubSample
 
-from optim import CyclicLR
 
 import pyximport; pyximport.install()
 from bounding_box import decode_bounding_box_list
@@ -34,129 +26,48 @@ from bounding_box import non_maximal_suppression_per_class
 from bounding_box import precision
 from bounding_box import recall
 from bounding_box import build_anchors
-from bounding_box import softmax
 from bounding_box import draw_bounding_boxes
 from bounding_box import average_precision
+
 cudnn.benchmark = True
 
+
 def train(*, config='config', resume=False):
-    cfg = {}
-    exec(open(config).read(), cfg, cfg)
-     
+    cfg = _read_config(config)
     lambda_ = cfg['lambda_'] # given to the classification loss relative to localization loss
     batch_size = cfg['batch_size']
     num_epoch = cfg['num_epoch']
     image_size = cfg['image_size']
-    lr = cfg['lr']
     gamma = cfg['gamma']
     mean = cfg['mean']
     std = cfg['std']
-    dataset = cfg['dataset']
     imbalance_strategy = cfg['imbalance_strategy']
     out_folder = cfg['out_folder'] 
-    classes = cfg.get('classes')
     if imbalance_strategy == 'class_weight':
         pos_weight = 1
         neg_weight = 0.3
     nms_iou_threshold = cfg['nms_iou_threshold']
-    bbox_encoding_iou_threshold = cfg['bbox_encoding_iou_threshold']
     eval_iou_threshold = cfg['eval_iou_threshold']
+    log_interval = cfg['log_interval']
+    nms_score_threshold = cfg['nms_score_threshold']
+    eval_interval = cfg['eval_interval']
     aspect_ratios = cfg['aspect_ratios']
-    log_interval = cfg.get('log_interval', 100)
-    eval_topk = cfg['eval_topk'] 
-    score_threshold = cfg['score_threshold']
+    nms_topk = 10
 
-    debug = False 
+    debug = True 
     if debug:
         log_interval = 30
     # anchor list for each scale (we have 6 scales)
-    # (order is important)
-    scales = cfg['scales']
-    anchor_list = [
-        build_anchors(scale=scales[0], feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
-        build_anchors(scale=scales[1], feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
-        build_anchors(scale=scales[2], feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
-        build_anchors(scale=scales[3], feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
-        build_anchors(scale=scales[4], feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
-        build_anchors(scale=scales[5], feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
-    ]
-    # transforms
-    normalize = transforms.Normalize(mean=mean, std=std)
-    train_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        normalize,
-    ])
-    valid_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    anchor_list = _build_anchor_list(cfg)
     # dataset for train and valid
     print('Loading dataset anotations...')
-    if dataset == 'COCO':
-        train_split = 'train' + str(cfg['dataset_version'])
-        val_split = 'val' + str(cfg['dataset_version'])
-        kwargs = dict(
-            folder=cfg['dataset_root_folder'],
-            anchor_list=anchor_list,
-            iou_threshold=bbox_encoding_iou_threshold,
-            classes=classes,
-            transform=train_transform
-        )
-        train_dataset = COCO(
-            split=train_split,
-            data_augmentation_params=cfg['data_augmentation_params'],
-            **kwargs
-        )
-        valid_dataset = COCO(
-            split=val_split,
-            data_augmentation_params={},
-            **kwargs,
-        )
-        train_evaluation = SubSample(COCO(
-            split=train_split,
-            data_augmentation_params={},
-            **kwargs,
-        ), nb=cfg['train_evaluation_size'])
-        valid_evaluation = SubSample(
-            valid_dataset, 
-            nb=cfg['val_evaluation_size']
-        )
-    elif dataset == 'VOC':
-        kwargs = dict(
-            folder=cfg['dataset_root_folder'],
-            anchor_list=anchor_list, 
-            which=cfg['dataset_version'], 
-            split='train', 
-            iou_threshold=bbox_encoding_iou_threshold,
-            classes=classes,
-            transform=train_transform
-        )
-        train_dataset = VOC(
-            split='train',
-            data_augmentation_params=cfg['data_augmentation_params'],
-            **kwargs,
-        )
-        valid_dataset = VOC(
-            split='val',
-            data_augmentation_params={},
-            **kwargs,
-        )
-        train_evaluation = SubSample(VOC(
-            split='train',
-            data_augmentation_params={},
-            **kwargs
-        ), nb=cfg['train_evaluation_size'])
-        valid_evaluation = SubSample(
-            valid_dataset, 
-            nb=cfg['val_evaluation_size']
-        )
-    else:
-        raise ValueError('Unknown dataset {}'.format(dataset))
+    (train_dataset, valid_dataset), (train_evaluation, valid_evaluation) = _build_dataset(
+        cfg,
+        anchor_list=anchor_list,
+    )
     print('Done loading dataset annotations.')
     if debug:
-        n = 2
+        n = 2 
         train_dataset = SubSample(train_dataset, nb=n)
         valid_dataset = SubSample(valid_dataset, nb=n)
         train_evaluation = SubSample(train_evaluation, nb=n)
@@ -170,28 +81,24 @@ def train(*, config='config', resume=False):
         shuffle=True, 
         batch_size=batch_size, 
         collate_fn=clfn,
-        num_workers=cfg.get('num_workers', 8),
-    )
-    valid_loader = DataLoader(
-        valid_dataset, 
-        batch_size=batch_size, 
-        collate_fn=clfn,
-        num_workers=cfg.get('num_workers', 8),
+        num_workers=cfg['num_workers'],
     )
     train_evaluation_loader = DataLoader(
         train_evaluation,
         batch_size=batch_size,
         collate_fn=clfn,
-        num_workers=cfg.get('num_workers', 8)
+        num_workers=cfg['num_workers'],
     )
     valid_evaluation_loader = DataLoader(
         valid_evaluation,
         batch_size=batch_size,
         collate_fn=clfn,
-        num_workers=cfg.get('num_workers', 8)
+        num_workers=cfg['num_workers'],
     )
     nb_classes = len(train_dataset.class_to_idx)
     bgid = train_dataset.class_to_idx['background']
+    class_ids = list(set(train_dataset.class_to_idx.values()) - set([bgid]))
+    class_ids = sorted(class_ids)
     print('Number of training images : {}'.format(len(train_dataset)))
     print('Number of valid images : {}'.format(len(valid_dataset)))
     print('Number of classes : {}'.format(nb_classes))
@@ -217,7 +124,7 @@ def train(*, config='config', resume=False):
             num_anchors=list(map(len, aspect_ratios)), 
             num_classes=nb_classes)
         model = model.cuda()
-        model.transform = valid_transform
+        model.transform = valid_dataset.transform 
         model.nb_classes = nb_classes
         model.aspect_ratios = aspect_ratios
         model.anchor_list = anchor_list
@@ -233,16 +140,16 @@ def train(*, config='config', resume=False):
         model.class_to_idx = train_dataset.class_to_idx
         model.mean = mean
         model.std = std
+        model.config = cfg
         print(model)
-
     if imbalance_strategy == 'class_weight':
         class_weight = torch.zeros(nb_classes)
         class_weight[0] = neg_weight
         class_weight[1:] = pos_weight
         class_weight = class_weight.cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    step_size = len(train_dataset) // batch_size
+    optimizer = torch.optim.SGD(model.parameters(), lr=0, momentum=0.9, weight_decay=5e-4)
+    #step_size = len(train_dataset) // batch_size
     #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     for epoch in range(first_epoch, num_epoch):
         epoch_t0 = time.time()
@@ -291,6 +198,7 @@ def train(*, config='config', resume=False):
             loss = l_loc + lambda_ * l_classif
             loss.backward()
             #scheduler.batch_step()
+            _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
             optimizer.step()
             model.avg_loss = model.avg_loss * gamma + loss.data[0] * (1 - gamma)
             model.avg_loc = model.avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
@@ -371,8 +279,15 @@ def train(*, config='config', resume=False):
                         ))
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # apply non-maximal suppression to predicted boxes
-                    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
-                    pred_boxes = [(box, class_id) for box, class_id in pred_boxes if class_id != bgid]
+                    # 1) for each class, filter low confidence predictions and then do NMS
+                    # 2) concat all the bboxes from all classes
+                    # 3) take to the topk (nms_topk)
+                    pred_boxes = non_maximal_suppression_per_class(
+                        pred_boxes, 
+                        background_class_id=bgid,
+                        iou_threshold=nms_iou_threshold,
+                        score_threshold=nms_score_threshold)
+                    pred_boxes = pred_boxes[0:nms_topk]
                     # get class names
                     gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
                     pred_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in pred_boxes]
@@ -386,12 +301,12 @@ def train(*, config='config', resume=False):
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
-            # LR schedule
-            _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
         if debug and model.nb_updates % 50 != 0:
             continue
         epoch_time = time.time() - epoch_t0
         print('Evaluation') 
+        if epoch % eval_interval != 0:
+            continue
         t0 = time.time()
         model.eval()
         metrics = defaultdict(list)
@@ -421,7 +336,6 @@ def train(*, config='config', resume=False):
 
                 # BP contains predicted bounding boxes for each scale
                 # CP contains predicted classes for each scale
-
                 for i in range(len(X)):
                     # for each example i  in mini-batch
                     gt_boxes = []
@@ -448,21 +362,26 @@ def train(*, config='config', resume=False):
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # mAP
                     mAP = []
-                    for class_id in model.class_to_idx.values():
-                        if class_id == bgid:
-                            continue
-                        AP = average_precision(pred_boxes, gt_boxes, class_id, topk=eval_topk, iou_threshold=eval_iou_threshold)
+                    for class_id in class_ids:
+                        AP = average_precision(
+                            pred_boxes, gt_boxes, class_id, 
+                            iou_threshold=eval_iou_threshold, 
+                            score_threshold=0.0,
+                        )
                         if AP is not None:
                             mAP.append(AP)
                     mAP = np.mean(mAP)
                     metrics['mAP_' + split_name].append(mAP)
                     # use the predicted boxes and groundtruth boxes to compute precision and recall
-                    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
+                    pred_boxes = non_maximal_suppression_per_class(
+                        pred_boxes, 
+                        background_class_id=bgid,
+                        iou_threshold=nms_iou_threshold,
+                        score_threshold=nms_score_threshold)
+                    pred_boxes = pred_boxes[0:nms_topk]
                     P = []
                     R = []
-                    for class_id in model.class_to_idx.values():
-                        if class_id == bgid:
-                            continue
+                    for class_id in class_ids:
                         t = [box for box, cl in gt_boxes if cl == class_id]
                         if len(t) == 0:
                             continue
@@ -484,7 +403,7 @@ def train(*, config='config', resume=False):
             stats[k].append(v)
         stats['epoch'].append(epoch)
         pd.DataFrame(stats).to_csv(stats_filename, index=False)
-
+        
 
 def _predict(model, samples):
     X = torch.stack([x for x, _, _ in samples], 0) 
@@ -581,7 +500,11 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
             include_scores=True,
         )
         pred_boxes.extend(boxes)
-    pred_boxes = non_maximal_suppression_per_class(pred_boxes, score_threshold=score_threshold)
+    pred_boxes = non_maximal_suppression_per_class(
+        pred_boxes, 
+        iou_threshold=model.config['nms_iou_threshold'],
+        background_class_id=model.class_to_idx['background'],
+        score_threshold=model.config['nms_score_threshold'])
     bgid = model.class_to_idx['background']
     pred_boxes = [(box, class_id) for box, class_id in pred_boxes if class_id != bgid]
     pred_boxes = [(box, model.idx_to_class[class_id]) for box, class_id in pred_boxes]
@@ -594,5 +517,154 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
     imsave(out, x)
 
 
+def find_aspect_ratios(*, config='config', nb=6):
+    from sklearn.cluster import KMeans
+    cfg = _read_config(config)
+    anchor_list = _build_anchor_list(cfg)
+    (dataset, _), _ = _build_dataset(cfg, anchor_list)
+    A = []
+    for i in range(len(dataset)):
+        bb = dataset.boxes[i]
+        for b in bb:
+            (x, y, w, h), _ = b
+            if h:
+                A.append(w/h)
+    clus = KMeans(n_clusters=nb)
+    A = np.array(A).reshape((-1, 1))
+    clus.fit(A)
+    print(clus.cluster_centers_.flatten().tolist())
+
+
+def draw_anchors(*, config='config', nb=10):
+ 
+    cfg = _read_config(config)
+    anchor_list = _build_anchor_list(cfg)
+    (dataset, _), _ = _build_dataset(cfg, anchor_list)
+    mean = cfg['mean']
+    std = cfg['std']
+    image_size = cfg['image_size']
+    for i in range(nb):
+        x, gt_boxes, encoding = dataset[i]
+        gt_boxes = [
+            ((x*image_size, y*image_size, w*image_size, h*image_size), dataset.idx_to_class[class_id]) 
+            for ((x, y, w, h), class_id) in gt_boxes
+        ]
+        x = x.numpy()
+        x = x.transpose((1, 2, 0))
+        x = x * np.array(std) + np.array(mean)
+        x = x.astype('float32')
+        anchor_boxes = []
+        for j, e in enumerate(encoding):
+            B, C, M = e
+            A = anchor_list[j]
+            hcoords, wcoords, k_id = np.where(M)
+            for h, w, k in zip(hcoords, wcoords, k_id):
+                a = image_size * A[h, w, k]
+                a = a.tolist()
+                c = C[h, w, k]
+                c = dataset.idx_to_class[c]
+                anchor_boxes.append((a, c))
+        pad = 100
+        im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+        im[pad:-pad, pad:-pad] = x
+        im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
+        im = draw_bounding_boxes(im, anchor_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+        imsave(os.path.join(cfg['out_folder'], 'anchors', 'sample_{:05d}.jpg'.format(i)), im)
+
+
+def _build_dataset(cfg, anchor_list):
+    mean = cfg['mean']
+    std = cfg['std']
+    image_size = cfg['image_size']
+    normalize = transforms.Normalize(mean=mean, std=std)
+    train_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    dataset = cfg['dataset']
+    if dataset == 'COCO':
+        train_split = 'train' + str(cfg['dataset_version'])
+        val_split = 'val' + str(cfg['dataset_version'])
+        kwargs = dict(
+            folder=cfg['dataset_root_folder'],
+            anchor_list=anchor_list,
+            iou_threshold=cfg['bbox_encoding_iou_threshold'],
+            classes=cfg['classes'],
+            transform=train_transform
+        )
+        train_dataset = COCO(
+            split=train_split,
+            data_augmentation_params=cfg['data_augmentation_params'],
+            **kwargs
+        )
+        valid_dataset = COCO(
+            split=val_split,
+            data_augmentation_params={},
+            **kwargs,
+        )
+        train_evaluation = SubSample(COCO(
+            split=train_split,
+            data_augmentation_params={},
+            **kwargs,
+        ), nb=cfg['train_evaluation_size'])
+        valid_evaluation = SubSample(
+            valid_dataset, 
+            nb=cfg['val_evaluation_size']
+        )
+    elif dataset == 'VOC':
+        kwargs = dict(
+            folder=cfg['dataset_root_folder'],
+            anchor_list=anchor_list, 
+            which=cfg['dataset_version'], 
+            iou_threshold=cfg['bbox_encoding_iou_threshold'],
+            classes=cfg['classes'],
+            transform=train_transform
+        )
+        train_dataset = VOC(
+            split='train',
+            data_augmentation_params=cfg['data_augmentation_params'],
+            **kwargs,
+        )
+        valid_dataset = VOC(
+            split='val',
+            data_augmentation_params={},
+            **kwargs,
+        )
+        train_evaluation = SubSample(VOC(
+            split='train',
+            data_augmentation_params={},
+            **kwargs
+        ), nb=cfg['train_evaluation_size'])
+        valid_evaluation = SubSample(
+            valid_dataset, 
+            nb=cfg['val_evaluation_size']
+        )
+    else:
+        raise ValueError('Unknown dataset {}'.format(dataset))
+    return (train_dataset, valid_dataset), (train_evaluation, valid_evaluation)
+
+
+def _build_anchor_list(cfg):
+    scales = cfg['scales']
+    aspect_ratios = cfg['aspect_ratios']
+    offset = cfg['offset']
+    anchor_list = [
+        build_anchors(scale=scales[0], offset=offset, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
+        build_anchors(scale=scales[1], offset=offset, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
+        build_anchors(scale=scales[2], offset=offset, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
+        build_anchors(scale=scales[3], offset=offset, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
+        build_anchors(scale=scales[4], offset=offset, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
+        build_anchors(scale=scales[5], offset=offset, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
+    ]
+    return anchor_list
+
+
+def _read_config(config):
+    cfg = {}
+    exec(open(config).read(), {}, cfg)
+    return cfg
+
+
 if __name__ == '__main__':
-    run([train, test])
+    run([train, test, draw_anchors, find_aspect_ratios])

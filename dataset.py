@@ -1,8 +1,6 @@
 import random
-import torchvision.transforms as transforms
 import json
 from collections import defaultdict
-import torch
 from torch.utils.data.dataset import Dataset
 from torchvision.datasets.folder import default_loader
 import os
@@ -11,7 +9,6 @@ import PIL
 
 import pyximport; pyximport.install()
 from bounding_box import encode_bounding_box_list_many_to_one
-from bounding_box import encode_bounding_box_list_one_to_one
 from bounding_box import rescale_bounding_box
 from bounding_box import center_bounding_box
 from bounding_box import normalize_bounding_box
@@ -32,8 +29,7 @@ class DetectionDataset(Dataset):
         filename = self.filenames[i]
         boxes = self.boxes[i]
         assert len(boxes) > 0, i
-
-        x = default_loader(os.path.join(self.imgs_folder, 'img', filename))
+        x = default_loader(filename)
         # randomly sample a patch
         
         da_params = self.data_augmentation_params
@@ -88,7 +84,7 @@ class COCO(DetectionDataset):
                  split='train2014', iou_threshold=0.5, 
                  data_augmentation_params=None,
                  classes=None, transform=None, random_state=42):
-        self.imgs_folder = os.path.join(folder, split)
+        self.folder = folder
         self.anchor_list = anchor_list
         self.annotations_folder = os.path.join(folder, 'annotations')
         self.split = split
@@ -103,15 +99,12 @@ class COCO(DetectionDataset):
     def _load_annotations(self):
         A = json.load(open(os.path.join(self.annotations_folder, 'instances_{}.json'.format(self.split))))
         B = json.load(open(os.path.join(self.annotations_folder, 'captions_{}.json'.format(self.split))))
-        
         class_id_name = {a['id']: a['name'] for a in A['categories']}
-
-        index_to_image_id = {}
         image_id_to_filename = {}
         for b in B['images']:
             image_id_to_filename[b['id']] = b['file_name']
-        
         keys = list(image_id_to_filename.keys())
+        keys = sorted(keys)
         self.rng.shuffle(keys)
         index_to_filename = {i: image_id_to_filename[k] for i, k in enumerate(keys)}
         image_id_to_index = {k: i for i, k in enumerate(keys)}
@@ -132,7 +125,6 @@ class COCO(DetectionDataset):
         self.class_to_idx['background'] = 0
         self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
         B = defaultdict(list)
-        F = {}
         for a in A['annotations']:
             bbox = a['bbox']
             cat = class_id_name[a['category_id']]
@@ -141,6 +133,7 @@ class COCO(DetectionDataset):
         indexes = list(index_to_filename.keys())
         self.boxes = [B[ind] for ind in indexes if len(B[ind]) > 0]
         self.filenames = [index_to_filename[ind] for ind in indexes if len(B[ind]) > 0]
+        self.filenames = [os.path.join(self.folder, self.split,  f) for f in self.filenames]
 
 
 class VOC(DetectionDataset):
@@ -182,6 +175,9 @@ class VOC(DetectionDataset):
         classes = list(classes)
         if self.classes:
             assert set(classes) == set(self.classes)
+        anns = sorted(anns)
+        anns = [(fname, bboxes) for fname, bboxes in anns if len(bboxes) > 0]
+ 
         self.rng.shuffle(anns)
         self.filenames = [fname for fname, bboxes in anns]
         self.boxes = [bboxes for fname, bboxes in anns]
@@ -211,46 +207,10 @@ class SubSample:
         self.background_class_id = dataset.background_class_id
         self.class_to_idx = dataset.class_to_idx
         self.idx_to_class = dataset.idx_to_class
+        self.transform = dataset.transform
 
     def __getitem__(self, i):
         return self.dataset[i]
         
     def __len__(self):
         return self.nb
-
-if __name__ == '__main__':
-    from bounding_box import build_anchors
-    aspect_ratios = [[1, 2, 3, 1/2, 1/3]] * 6
-    anchor_list = [
-        build_anchors(scale=0.2, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
-        build_anchors(scale=0.34, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
-        build_anchors(scale=0.48, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
-        build_anchors(scale=0.62, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
-        build_anchors(scale=0.76, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
-        build_anchors(scale=0.90, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
-    ]
-    transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.ToTensor(),
-    ])
-    classes = ['bottle', 'cup', 'wine glass', 'bowl']
-    dataset = COCO(
-        'data/coco', 
-        anchor_list, 
-        split='train2014',
-        iou_threshold=0.5,
-        classes=classes,
-        transform=transform
-    )
-    A = []
-    for i in range(len(dataset)):
-        bb = dataset.boxes[i]
-        print(i, len(dataset))
-        for b in bb:
-            (x, y, w, h), _ = b
-            A.append(w/h)
-    from sklearn.cluster import KMeans
-    clus = KMeans(n_clusters=6)
-    A = np.array(A).reshape((-1, 1))
-    clus.fit(A)
-    print(clus.cluster_centers_)

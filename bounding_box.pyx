@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import cv2
 from itertools import chain
-from joblib import Memory
 from hashlib import md5
 import pandas as pd
 
@@ -13,13 +12,13 @@ cimport numpy as np
 X, Y, W, H = 0, 1, 2, 3
 eps = 1e-10
 
-def build_anchors(scale=1, feature_map_size=4, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
+def build_anchors(scale=1, feature_map_size=4, offset=0.5, aspect_ratios=(1, 2, 3, 1. / 2, 1. / 3)):
     A = np.empty((feature_map_size, feature_map_size, len(aspect_ratios), 4))
     for i in range(feature_map_size):
         for j in range(feature_map_size):
             for k, ar in enumerate(aspect_ratios):
-                x = (k + 0.5) / feature_map_size
-                y = (j + 0.5) / feature_map_size
+                x = (k + offset) / feature_map_size
+                y = (j + offset) / feature_map_size
                 w = (scale * np.sqrt(ar))
                 h = (scale / np.sqrt(ar))
                 A[i, j, k] = x, y, w, h
@@ -100,8 +99,8 @@ cpdef list encode_bounding_box_list_many_to_one(
                         B[ha, wa, k, Y] = ((by - ay) / ah) / variance[1]
                         B[ha, wa, k, W] = (np.log(eps + bw / aw)) / variance[2]
                         B[ha, wa, k, H] = (np.log(eps + bh / ah)) / variance[3]
-                        C[ha, wa, k] = class_id if best_iou > iou_threshold else background_class_id
-                        M[ha, wa, k] = best_iou > iou_threshold
+                        C[ha, wa, k] = class_id if best_iou >= iou_threshold else background_class_id
+                        M[ha, wa, k] = best_iou >= iou_threshold
     return E
 
 
@@ -149,7 +148,7 @@ cpdef tuple encode_bounding_box_list_one_to_one(
         B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
         B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
         C[best_ha, best_wa, best_k] = class_id
-        M[best_ha, best_wa, best_k] = True#best_iou > iou_threshold
+        M[best_ha, best_wa, best_k] = True
     return B, C, M
 
 
@@ -269,38 +268,45 @@ def softmax(x, axis=1):
     return e_x / e_x.sum(axis=axis, keepdims=True) # only difference"
 
 
-def non_maximal_suppression_per_class(bbox_list, iou_threshold=0.5, score_threshold=0.0):
+def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_threshold=0.5, score_threshold=0.0):
     bb_scores = bbox_list[0]
     bb, scores = bb_scores
     nb_classes = len(scores)
     bblist_all = []
     for cl in range(nb_classes):
-        bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] > score_threshold]
+        if cl == background_class_id:
+            continue
+        bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] >= score_threshold]
         bb = non_maximal_suppression(bb, iou_threshold=iou_threshold)
-        bb = [(b, cl) for b in bb]
+        bb = [(b, cl, score) for (b, score) in bb]
         bblist_all.extend(bb)
+    
+    def score_fn(b):
+        bbox, cl, score = b
+        return score
+    bblist_all = sorted(bblist_all, key=score_fn, reverse=True)
+    bblist_all = [(box, cl) for (box, cl, score) in bblist_all]
     return bblist_all
 
 
-def non_maximal_suppression(bbox_list, iou_threshold=0.5):
-    L = set(bbox_list)
+def non_maximal_suppression(list bbox_list, float iou_threshold=0.5):
     def score_fn(k):
         bbox, score = k
         return score
+    L = sorted(bbox_list, key=score_fn, reverse=True)
     final_bbox_list = []
     f = []
     while len(L) > 0:
-        cur = max(L, key=score_fn)
+        cur = L[0] 
         bbox, score = cur
         remove = [cur]
         for l in L:
             bbox_, _ = l
-            if iou(bbox, bbox_) > iou_threshold:
+            if iou(bbox, bbox_) >= iou_threshold:
                 remove.append(l)
         remove = set(remove)
-        for r in remove:
-            L.remove(r)
-        final_bbox_list.append(bbox) 
+        L = [l for l in L if l not in remove]
+        final_bbox_list.append((bbox, score)) 
     return final_bbox_list
 
 
@@ -308,41 +314,58 @@ def precision(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
         return 0
     M = matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=iou_threshold)
-    return (M.sum(axis=0) > 0).astype('float32').mean()
+    return (M.sum(axis=1) > 0).astype('float32').mean()
 
 
 def recall(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     if len(bbox_pred_list) == 0 or len(bbox_true_list) == 0:
         return 0
     M = matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=iou_threshold)
-    return (M.sum(axis=1) > 0).astype('float32').mean()
-
+    return (M.sum(axis=0) > 0).astype('float32').mean()
 
 def average_precision(
     bbox_pred_list_with_scores, bbox_true_list, 
     class_id,
     recalls_mAP=np.linspace(0, 1, 11),
     iou_threshold=0.5,
-    topk=100):
-    # https://medium.com/@jonathan_hui/map-mean-average-precision-for-object-detection-45c121a31173
+    score_threshold=0.0):
+    
+    # Check 
+    #https://medium.com/@jonathan_hui/map-mean-average-precision-for-object-detection-45c121a31173
+    # for more info
+
+
+    # -- get prediction list of bboxes 
     def score_fn(k):
         bbox, scores = k
         score = scores[class_id]
         return score
     bbox_pred_list_with_scores = sorted(bbox_pred_list_with_scores, key=score_fn, reverse=True)
+    bbox_pred_list = [bbox for bbox, scores in bbox_pred_list_with_scores if scores[class_id] >= score_threshold]
+    
+    # --- get true list of bboxes
+    bbox_true_list = [bbox for bbox, cl in bbox_true_list if cl == class_id]
+    if len(bbox_true_list) == 0:
+        return None
+    
+    # --- compute precison and recall for each rank
+    cdef np.ndarray R = np.zeros(len(bbox_true_list))
+    cdef int nb_precision = 0
+    cdef int nb_recall = 0
     precisions = []
     recalls = []
-    tb = [bbox for bbox, cl in bbox_true_list if cl == class_id]
-    if len(tb) == 0:
-        return
-    for i in range(min(len(bbox_pred_list_with_scores), topk)):
-        # precision and recall with top-i scores
-        pb = bbox_pred_list_with_scores[0:i + 1]
-        pb = [bbox for bbox, scores in pb]
-        prec = precision(pb, tb, iou_threshold=iou_threshold)
-        re = recall(pb, tb, iou_threshold=iou_threshold)
-        precisions.append(prec)
-        recalls.append(re)
+    for i, bbox_pred in enumerate(bbox_pred_list):
+        for j, bbox_true in enumerate(bbox_true_list):
+            if iou(bbox_pred, bbox_true) >= iou_threshold:
+                if R[j] == 0:
+                    R[j] = 1
+                    nb_recall += 1
+                nb_precision += 1
+        p = nb_precision / (i + 1)
+        r = nb_recall / len(bbox_true_list)
+        precisions.append(p)
+        recalls.append(r)
+    # --- compute mAP
     vals = []
     for r in recalls_mAP:
        val = max((precisions[i] for i in range(len(precisions)) if recalls[i] >= r), default=0)
@@ -354,7 +377,7 @@ def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     M = np.zeros((len(bbox_pred_list), len(bbox_true_list)))
     for i, bp in enumerate(bbox_pred_list):
         for j, bt in enumerate(bbox_true_list):
-            if iou(bt, bp) > iou_threshold:
+            if iou(bt, bp) >= iou_threshold:
                 M[i, j] = 1
     return M
 

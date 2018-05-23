@@ -110,7 +110,7 @@ class SSD(nn.Module):
         S = 20
         self.norm1b = L2Norm(num_anchors[0] * 4, S)
         self.norm1c = L2Norm(num_anchors[0] * num_classes, S)
-
+        
         self.norm2b = L2Norm(num_anchors[1] * 4, S)
         self.norm2c = L2Norm(num_anchors[1] * num_classes, S)
         
