@@ -285,7 +285,7 @@ def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_thre
         bbox, cl, score = b
         return score
     bblist_all = sorted(bblist_all, key=score_fn, reverse=True)
-    bblist_all = [(box, cl) for (box, cl, score) in bblist_all]
+    #bblist_all = [(box, cl) for (box, cl, score) in bblist_all]
     return bblist_all
 
 
@@ -334,7 +334,6 @@ def average_precision(
     #https://medium.com/@jonathan_hui/map-mean-average-precision-for-object-detection-45c121a31173
     # for more info
 
-
     # -- get prediction list of bboxes 
     def score_fn(k):
         bbox, scores = k
@@ -344,7 +343,7 @@ def average_precision(
     bbox_pred_list = [bbox for bbox, scores in bbox_pred_list_with_scores if scores[class_id] >= score_threshold]
     
     # --- get true list of bboxes
-    bbox_true_list = [bbox for bbox, cl in bbox_true_list if cl == class_id]
+    bbox_true_list = [bbox for (bbox, cl) in bbox_true_list if cl == class_id]
     if len(bbox_true_list) == 0:
         return None
     
@@ -402,7 +401,14 @@ def draw_bounding_boxes(
     font=cv2.FONT_HERSHEY_PLAIN, 
     font_scale=1.0,
     pad=0):
-    for bbox, class_name in bbox_list:
+    for bb in bbox_list:
+        if len(bb) == 3:
+            bbox, class_name, score = bb
+        elif len(bb) == 2:
+            bbox, class_name = bb
+            score = None
+        else:
+            raise ValueError(bb)
         bbox = uncenter_bounding_box(bbox)
         x, y, w, h = bbox
         x = int(x) + pad
@@ -418,6 +424,9 @@ def draw_bounding_boxes(
         if y + h > image.shape[1]:
             continue
         image = cv2.rectangle(image, (x, y), (x + w, y + h), color)
-        text = class_name
+        if score:
+            text = '{}({:.2f})'.format(class_name, score)
+        else:
+            text = class_name
         image = cv2.putText(image, text, (x, y), font, font_scale, text_color, 2, cv2.LINE_AA)
     return image

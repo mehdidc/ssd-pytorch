@@ -34,7 +34,8 @@ cudnn.benchmark = True
 
 def train(*, config='config', resume=False):
     cfg = _read_config(config)
-    lambda_ = cfg['lambda_'] # given to the classification loss relative to localization loss
+    w_loc = cfg['w_loc']
+    w_classif = cfg['w_classif']
     batch_size = cfg['batch_size']
     num_epoch = cfg['num_epoch']
     image_size = cfg['image_size']
@@ -43,6 +44,7 @@ def train(*, config='config', resume=False):
     std = cfg['std']
     imbalance_strategy = cfg['imbalance_strategy']
     out_folder = cfg['out_folder'] 
+    background_ratio = cfg['background_ratio']
     if imbalance_strategy == 'class_weight':
         pos_weight = 1
         neg_weight = 0.3
@@ -52,9 +54,20 @@ def train(*, config='config', resume=False):
     nms_score_threshold = cfg['nms_score_threshold']
     eval_interval = cfg['eval_interval']
     aspect_ratios = cfg['aspect_ratios']
-    nms_topk = 10
+    nms_topk = cfg['nms_topk']
+    debug = cfg['debug'] 
 
-    debug = True 
+    folders = [
+        'train', 
+        'eval_train', 
+        'eval_valid', 
+    ]
+    for f in folders:
+        try:
+            os.makedirs(os.path.join(out_folder, f))
+        except OSError:
+            pass
+
     if debug:
         log_interval = 30
     # anchor list for each scale (we have 6 scales)
@@ -186,7 +199,7 @@ def train(*, config='config', resume=False):
                 cp_neg = cp[neg]
                 cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
                 vals, indices = cp_neg_loss.sort(descending=True)
-                nb = len(ct_pos) * 3 # 3x more neg than pos as in the paper
+                nb = len(ct_pos) * background_ratio # 3x more neg than pos as in the paper
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
                 l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
@@ -195,7 +208,7 @@ def train(*, config='config', resume=False):
             elif imbalance_strategy == 'nothing':
                 l_classif = cross_entropy(cp, ct, size_average=False) / N
             model.zero_grad()
-            loss = l_loc + lambda_ * l_classif
+            loss = w_loc * l_loc + w_classif * l_classif
             loss.backward()
             #scheduler.batch_step()
             _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
@@ -290,32 +303,36 @@ def train(*, config='config', resume=False):
                     pred_boxes = pred_boxes[0:nms_topk]
                     # get class names
                     gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
-                    pred_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in pred_boxes]
+                    pred_boxes = [(box, train_dataset.idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
                     # draw boxes
-                    pad = 30
+                    pad = cfg['pad']
                     im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
                     im[pad:-pad, pad:-pad] = x
                     im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
                     im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
-                    imsave(os.path.join(out_folder, 'sample_{:05d}.jpg'.format(i)), im)
+                    imsave(os.path.join(out_folder, 'train', 'sample_{:05d}.jpg'.format(i)), im)
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
-        if debug and model.nb_updates % 50 != 0:
-            continue
+        #if debug and model.nb_updates % 50 != 0:
+        #    continue
         epoch_time = time.time() - epoch_t0
-        print('Evaluation') 
         if epoch % eval_interval != 0:
             continue
+        print('Evaluation') 
         t0 = time.time()
         model.eval()
         metrics = defaultdict(list)
         metrics['train_time'] = [epoch_time]
         for split_name, loader in (('train', train_evaluation_loader), ('valid', valid_evaluation_loader)):
             t0 = time.time()
+            im_index = 0
             for batch, samples, in enumerate(loader):
                 tt0 = time.time()
                 X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
+
+                X = X.data.cpu().numpy()
+
                 B = [[b for b, c, m in y] for y in Y]
                 B = [torch.from_numpy(np.array(b)).float() for b in B]
                 C = [[c for b, c, m in y] for y in Y]
@@ -340,6 +357,11 @@ def train(*, config='config', resume=False):
                     # for each example i  in mini-batch
                     gt_boxes = []
                     pred_boxes = []
+                    x = X[i]
+                    x = x.transpose((1, 2, 0))
+                    x = x * np.array(std) + np.array(mean)
+                    x = x.astype('float32')
+
                     for j in range(len(Y)):
                         # for each scale j
                         ct = C[j][i]# class_id
@@ -369,6 +391,7 @@ def train(*, config='config', resume=False):
                             score_threshold=0.0,
                         )
                         if AP is not None:
+                            metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
                             mAP.append(AP)
                     mAP = np.mean(mAP)
                     metrics['mAP_' + split_name].append(mAP)
@@ -385,13 +408,26 @@ def train(*, config='config', resume=False):
                         t = [box for box, cl in gt_boxes if cl == class_id]
                         if len(t) == 0:
                             continue
-                        p = [box for box, cl in pred_boxes if cl == class_id]
+                        p = [box for box, cl, score in pred_boxes if cl == class_id]
                         prec = precision(p, t, iou_threshold=eval_iou_threshold)
                         re = recall(p, t, iou_threshold=eval_iou_threshold)
+                        metrics['precision_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(prec)
+                        metrics['recall_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(re)
                         P.append(prec)
                         R.append(re)
                     metrics['precision_' + split_name].append(np.mean(P))
                     metrics['recall_' + split_name].append(np.mean(R))
+                    gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
+                    pred_boxes = [(box, train_dataset.idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
+                    # draw boxes
+                    pad = cfg['pad']
+                    im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+                    im[pad:-pad, pad:-pad] = x
+                    im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
+                    im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+                    imsave(os.path.join(out_folder, 'eval_{}'.format(split_name), 'sample_{:05d}.jpg'.format(im_index)), im)
+                    im_index += 1
+
                 delta = time.time() - tt0
                 print('Eval Batch {:04d}/{:04d} on split {} Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
             delta = time.time() - t0

@@ -47,46 +47,61 @@ class SSD(nn.Module):
         )
         self.conv5 = nn.Sequential(
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(True),
         )
         self.conv6 = nn.Sequential(
             nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.BatchNorm2d(1024),
             nn.ReLU(True),
             nn.Conv2d(1024, 1024, kernel_size=1),
+            nn.BatchNorm2d(1024),
             nn.ReLU(True)
         )
         self.conv7 = nn.Sequential(
             nn.Conv2d(1024, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(True),
             nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(512),
             nn.ReLU(True)
         )
         self.conv8 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv9 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv10 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv11 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.out1b = nn.Conv2d(512, num_anchors[0] * 4, kernel_size=3, padding=1)
@@ -125,6 +140,20 @@ class SSD(nn.Module):
 
         self.norm6b = L2Norm(num_anchors[5] * 4, S)
         self.norm6c = L2Norm(num_anchors[5] * num_classes, S)
+    
+        idt = lambda x:x
+        self.norm1b = idt
+        self.norm1c = idt
+        self.norm2b = idt
+        self.norm2c = idt
+        self.norm3b = idt
+        self.norm3c = idt
+        self.norm4b = idt
+        self.norm4c = idt
+        self.norm5b = idt
+        self.norm5c = idt
+        self.norm6b = idt
+        self.norm6c = idt
  
         self.apply(weights_init)
         # pretrained weights
