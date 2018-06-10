@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 from torch.nn.functional import smooth_l1_loss, cross_entropy
-from model import SSD
+import model as model_module
 from torchvision.datasets.folder import default_loader
 
 from dataset import COCO
@@ -47,7 +47,7 @@ def train(*, config='config', resume=False):
     background_ratio = cfg['background_ratio']
     if imbalance_strategy == 'class_weight':
         pos_weight = 1
-        neg_weight = 0.3
+        neg_weight = 0.01
     nms_iou_threshold = cfg['nms_iou_threshold']
     eval_iou_threshold = cfg['eval_iou_threshold']
     log_interval = cfg['log_interval']
@@ -67,7 +67,6 @@ def train(*, config='config', resume=False):
             os.makedirs(os.path.join(out_folder, f))
         except OSError:
             pass
-
     if debug:
         log_interval = 30
     # anchor list for each scale (we have 6 scales)
@@ -133,9 +132,13 @@ def train(*, config='config', resume=False):
         else:
             train_stats = defaultdict(list)
     else:
-        model = SSD(
+        model_class = getattr(model_module, cfg['model_name'])
+        kw = cfg.get('model_config', {})
+        model = model_class(
             num_anchors=list(map(len, aspect_ratios)), 
-            num_classes=nb_classes)
+            num_classes=nb_classes,
+            **kw     
+        )
         model = model.cuda()
         model.transform = valid_dataset.transform 
         model.nb_classes = nb_classes
@@ -186,6 +189,7 @@ def train(*, config='config', resume=False):
             nb_pos = m.long().sum()
             N = max(nb_pos.data[0], 1.0)
             # localization loss
+            #print(bp.size(), bt.size(), ct.size(), cp.size())
             l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
             # classif loss
             if imbalance_strategy == 'hard_negative_mining':
@@ -400,7 +404,8 @@ def train(*, config='config', resume=False):
                         pred_boxes, 
                         background_class_id=bgid,
                         iou_threshold=nms_iou_threshold,
-                        score_threshold=nms_score_threshold)
+                        score_threshold=nms_score_threshold
+                    )
                     pred_boxes = pred_boxes[0:nms_topk]
                     P = []
                     R = []
@@ -685,14 +690,10 @@ def _build_anchor_list(cfg):
     scales = cfg['scales']
     aspect_ratios = cfg['aspect_ratios']
     offset = cfg['offset']
-    anchor_list = [
-        build_anchors(scale=scales[0], offset=offset, feature_map_size=37, aspect_ratios=aspect_ratios[0]),   
-        build_anchors(scale=scales[1], offset=offset, feature_map_size=19, aspect_ratios=aspect_ratios[1]),   
-        build_anchors(scale=scales[2], offset=offset, feature_map_size=10, aspect_ratios=aspect_ratios[2]),   
-        build_anchors(scale=scales[3], offset=offset, feature_map_size=5, aspect_ratios=aspect_ratios[3]),   
-        build_anchors(scale=scales[4], offset=offset, feature_map_size=3, aspect_ratios=aspect_ratios[4]),   
-        build_anchors(scale=scales[5], offset=offset, feature_map_size=1, aspect_ratios=aspect_ratios[5]),   
-    ]
+    fs = cfg['feature_map_sizes']
+    assert len(scales) == len(aspect_ratios) == len(fs)
+    nb = len(scales)
+    anchor_list = [build_anchors(scales[i], offset=offset, feature_map_size=fs[i], aspect_ratios=aspect_ratios[i]) for i in range(nb)]
     return anchor_list
 
 

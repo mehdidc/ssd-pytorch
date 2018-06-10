@@ -208,7 +208,7 @@ def iou(bbox1, bbox2):
     else:
         inter = winter * hinter
     union = w * h + ww * hh - inter
-    return inter / union
+    return inter / (union + eps)
 
 
 def uncenter_bounding_box(bbox):
@@ -276,16 +276,17 @@ def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_thre
     for cl in range(nb_classes):
         if cl == background_class_id:
             continue
+        # consider only bboxes for which the max score corresponds to the current class
+        #bb = [(box, scores[cl]) for box, scores in bbox_list if np.argmax(scores) == cl]
+        # consider only bboxes for which the score for the current class exceeds the threshold
         bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] >= score_threshold]
         bb = non_maximal_suppression(bb, iou_threshold=iou_threshold)
         bb = [(b, cl, score) for (b, score) in bb]
         bblist_all.extend(bb)
-    
     def score_fn(b):
         bbox, cl, score = b
         return score
     bblist_all = sorted(bblist_all, key=score_fn, reverse=True)
-    #bblist_all = [(box, cl) for (box, cl, score) in bblist_all]
     return bblist_all
 
 
@@ -360,7 +361,7 @@ def average_precision(
                     R[j] = 1
                     nb_recall += 1
                 nb_precision += 1
-        p = nb_precision / (i + 1)
+        p = nb_precision / (i + 2)
         r = nb_recall / len(bbox_true_list)
         precisions.append(p)
         recalls.append(r)
@@ -411,6 +412,8 @@ def draw_bounding_boxes(
             raise ValueError(bb)
         bbox = uncenter_bounding_box(bbox)
         x, y, w, h = bbox
+        if np.isinf(x) or np.isinf(y) or np.isinf(w) or np.isinf(h):
+            continue
         x = int(x) + pad
         y = int(y) + pad
         w = int(w)

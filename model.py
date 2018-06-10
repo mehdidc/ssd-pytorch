@@ -1,13 +1,94 @@
 import torch.nn as nn
 import torch
-import torch.nn as nn
 from torch.nn.init import xavier_uniform
 from torch.autograd import Variable
 import torchvision.models as models
 import torch.nn.functional as F
+from torchvision.models.resnet import BasicBlock
+
+class SSD_Resnet(nn.Module):
+
+    def __init__(self, num_anchors=[4]*6, num_classes=2, arch='resnet34', fo=64):
+        super().__init__()
+        assert len(num_anchors) == 6
+        self.fo = fo
+        self.arch = arch
+        self.base = getattr(models, arch)(pretrained=True)
+        fi = 512
+        self.layer5 = self.base._make_layer(BasicBlock, fi, fo, stride=2)
+        self.layer6 = self.base._make_layer(BasicBlock, fo, fo, stride=2)
+        self.layer7 = self.base._make_layer(BasicBlock, fo, fo, stride=2)
+
+        self.layer5.apply(weights_init)
+        self.layer6.apply(weights_init)
+        self.layer7.apply(weights_init)
+
+        if arch == 'resnet18':
+            f_in = [128, 256, 512, fi, fo, fo]
+        elif arch == 'resnet34':
+            f_in = [128, 256, 512, fi, fo, fo]
+        elif arch == 'resnet50':
+            f_in = [512, 1024, 2048, fi, fo, fo]
+        else:
+            raise ValueError(arch)
+        self.out1b = nn.Conv2d(f_in[0], num_anchors[0] * 4, kernel_size=3, padding=1)
+        self.out1c = nn.Conv2d(f_in[0], num_anchors[0] * num_classes, kernel_size=3, padding=1)
+        
+        self.out2b = nn.Conv2d(f_in[1], num_anchors[1] * 4, kernel_size=3, padding=1)
+        self.out2c = nn.Conv2d(f_in[1], num_anchors[1] * num_classes, kernel_size=3, padding=1)
+        
+        self.out3b = nn.Conv2d(f_in[2], num_anchors[2] * 4, kernel_size=3, padding=1)
+        self.out3c = nn.Conv2d(f_in[2], num_anchors[2] * num_classes, kernel_size=3, padding=1)
+ 
+        self.out4b = nn.Conv2d(f_in[3], num_anchors[3] * 4, kernel_size=3, padding=1)
+        self.out4c = nn.Conv2d(f_in[3], num_anchors[3] * num_classes, kernel_size=3, padding=1)
+        
+        self.out5b = nn.Conv2d(f_in[4], num_anchors[4] * 4, kernel_size=3, padding=1)
+        self.out5c = nn.Conv2d(f_in[4],  num_anchors[4] * num_classes, kernel_size=3, padding=1)
+        
+        self.out6b = nn.Conv2d(f_in[5], num_anchors[5] * 4, kernel_size=3, padding=1)
+        self.out6c = nn.Conv2d(f_in[5], num_anchors[5] * num_classes, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        outs = []
+        x = self.base.conv1(x)
+        x = self.base.bn1(x)
+        x = self.base.relu(x)
+        x = self.base.maxpool(x)
+        """
+        x = self.base.layer1(x)
+        print(x.size())
+        x = self.base.layer2(x)
+        print(x.size())
+        x = self.base.layer3(x)
+        print(x.size())
+        x = self.base.layer4(x)
+        print(x.size())
+        x = self.layer5(x)
+        print(x.size())
+        x = self.layer6(x)
+        print(x.size())
+        x = self.layer7(x)
+        print(x.size())
+        sys.exit(0)
+        """
+        x = self.base.layer1(x)
+        x = self.base.layer2(x)
+        outs.append((self.out1b(x), self.out1c(x)))
+        x = self.base.layer3(x)
+        outs.append((self.out2b(x), self.out2c(x)))
+        x = self.base.layer4(x)
+        outs.append((self.out3b(x), self.out3c(x)))
+        x = self.layer5(x)
+        outs.append((self.out4b(x), self.out4c(x)))
+        x = self.layer6(x)
+        outs.append((self.out5b(x), self.out5c(x)))
+        x = self.layer7(x)
+        outs.append((self.out6b(x), self.out6c(x)))
+        return outs
 
 
-class SSD(nn.Module):
+class SSD_VGG(nn.Module):
 
     def __init__(self, num_anchors=[4, 4, 4, 4, 4, 4], num_classes=2):
         super().__init__()
@@ -47,61 +128,61 @@ class SSD(nn.Module):
         )
         self.conv5 = nn.Sequential(
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            #nn.BatchNorm2d(512),
             nn.ReLU(True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            #nn.BatchNorm2d(512),
             nn.ReLU(True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            #nn.BatchNorm2d(512),
             nn.ReLU(True),
         )
         self.conv6 = nn.Sequential(
-            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
-            nn.BatchNorm2d(1024),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=6, dilation=6),
+            #nn.BatchNorm2d(1024),
             nn.ReLU(True),
             nn.Conv2d(1024, 1024, kernel_size=1),
-            nn.BatchNorm2d(1024),
+            #nn.BatchNorm2d(1024),
             nn.ReLU(True)
         )
         self.conv7 = nn.Sequential(
             nn.Conv2d(1024, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            #nn.BatchNorm2d(256),
             nn.ReLU(True),
             nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(512),
+            #nn.BatchNorm2d(512),
             nn.ReLU(True)
         )
         self.conv8 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
+            #nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            #nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv9 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
+            #nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            #nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv10 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
+            #nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=1),
-            nn.BatchNorm2d(256),
+            #nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.conv11 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
+            #nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=1),
-            nn.BatchNorm2d(256),
+            #nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
         self.out1b = nn.Conv2d(512, num_anchors[0] * 4, kernel_size=3, padding=1)
@@ -140,21 +221,6 @@ class SSD(nn.Module):
 
         self.norm6b = L2Norm(num_anchors[5] * 4, S)
         self.norm6c = L2Norm(num_anchors[5] * num_classes, S)
-    
-        idt = lambda x:x
-        self.norm1b = idt
-        self.norm1c = idt
-        self.norm2b = idt
-        self.norm2c = idt
-        self.norm3b = idt
-        self.norm3c = idt
-        self.norm4b = idt
-        self.norm4c = idt
-        self.norm5b = idt
-        self.norm5c = idt
-        self.norm6b = idt
-        self.norm6c = idt
- 
         self.apply(weights_init)
         # pretrained weights
         vgg16 = models.vgg16(pretrained=True)
@@ -163,7 +229,6 @@ class SSD(nn.Module):
                 self.base[i].weight = vgg16.features[i].weight
                 self.base[i].bias = vgg16.features[i].bias
 
-    
     def forward(self, x):
         outs = []
         x = self.base(x)
@@ -221,8 +286,9 @@ class L2Norm(nn.Module):
         scale = self.weight[None,:,None,None]
         return scale * x
 
+
 if __name__ == '__main__':
-    m = SSD()
+    m = SSD_Resnet()
     x = Variable(torch.randn(1, 3, 300, 300))
     outs = m(x)
     for a, b in outs:
