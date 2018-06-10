@@ -361,7 +361,7 @@ def average_precision(
                     R[j] = 1
                     nb_recall += 1
                 nb_precision += 1
-        p = nb_precision / (i + 2)
+        p = nb_precision / (i + 1)
         r = nb_recall / len(bbox_true_list)
         precisions.append(p)
         recalls.append(r)
