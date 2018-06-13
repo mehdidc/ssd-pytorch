@@ -30,7 +30,7 @@ class SSD_Resnet(nn.Module):
         elif arch == 'resnet50':
             f_in = [512, 1024, 2048, fi, fo, fo]
         else:
-            raise ValueError(arch)
+            raise ValueError('Architecture {} not supported'.format(arch))
         self.out1b = nn.Conv2d(f_in[0], num_anchors[0] * 4, kernel_size=3, padding=1)
         self.out1c = nn.Conv2d(f_in[0], num_anchors[0] * num_classes, kernel_size=3, padding=1)
         
@@ -55,23 +55,6 @@ class SSD_Resnet(nn.Module):
         x = self.base.bn1(x)
         x = self.base.relu(x)
         x = self.base.maxpool(x)
-        """
-        x = self.base.layer1(x)
-        print(x.size())
-        x = self.base.layer2(x)
-        print(x.size())
-        x = self.base.layer3(x)
-        print(x.size())
-        x = self.base.layer4(x)
-        print(x.size())
-        x = self.layer5(x)
-        print(x.size())
-        x = self.layer6(x)
-        print(x.size())
-        x = self.layer7(x)
-        print(x.size())
-        sys.exit(0)
-        """
         x = self.base.layer1(x)
         x = self.base.layer2(x)
         outs.append((self.out1b(x), self.out1c(x)))
