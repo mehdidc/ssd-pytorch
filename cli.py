@@ -44,10 +44,10 @@ def train(*, config='config', resume=False):
     std = cfg['std']
     imbalance_strategy = cfg['imbalance_strategy']
     out_folder = cfg['out_folder'] 
-    background_ratio = cfg['background_ratio']
+    negative_per_positive = cfg['negative_per_positive']
     if imbalance_strategy == 'class_weight':
-        pos_weight = 1
-        neg_weight = 0.01
+        pos_weight = cfg['pos_weight']
+        neg_weight = cfg['neg_weight']
     nms_iou_threshold = cfg['nms_iou_threshold']
     eval_iou_threshold = cfg['eval_iou_threshold']
     log_interval = cfg['log_interval']
@@ -79,7 +79,7 @@ def train(*, config='config', resume=False):
     )
     print('Done loading dataset annotations.')
     if debug:
-        n = 2 
+        n = 100
         train_dataset = SubSample(train_dataset, nb=n)
         valid_dataset = SubSample(valid_dataset, nb=n)
         train_evaluation = SubSample(train_evaluation, nb=n)
@@ -165,6 +165,8 @@ def train(*, config='config', resume=False):
         class_weight = class_weight.cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0, momentum=0.9, weight_decay=5e-4)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=0)
+    #optimizer = torch.optim.RMSprop(model.parameters(), lr=0)
     #step_size = len(train_dataset) // batch_size
     #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
     for epoch in range(first_epoch, num_epoch):
@@ -193,7 +195,6 @@ def train(*, config='config', resume=False):
             l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
             # classif loss
             if imbalance_strategy == 'hard_negative_mining':
-                # Hard negative mining
                 ind = torch.arange(len(ct))
                 pos = ind[(ct.data.cpu() > 0)].long().cuda()
                 neg = ind[(ct.data.cpu() == 0)].long().cuda()
@@ -203,9 +204,23 @@ def train(*, config='config', resume=False):
                 cp_neg = cp[neg]
                 cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
                 vals, indices = cp_neg_loss.sort(descending=True)
-                nb = len(ct_pos) * background_ratio # 3x more neg than pos as in the paper
+                nb = len(ct_pos) * negative_per_positive # 3x more neg than pos as in the paper
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
+                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
+            elif imbalance_strategy == 'undersampling':
+                ind = torch.arange(len(ct))
+                pos = ind[(ct.data.cpu() > 0)].long().cuda()
+                neg = ind[(ct.data.cpu() == 0)].long().cuda()
+                ct_pos = ct[pos]
+                cp_pos = cp[pos]
+                ct_neg = ct[neg]
+                cp_neg = cp[neg]
+                nb = len(ct_pos) * negative_per_positive
+                inds = torch.from_numpy(np.random.randint(0, len(ct_neg), nb))
+                inds = inds.long().cuda()
+                ct_neg = ct_neg[inds]
+                cp_neg = cp_neg[inds]
                 l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'class_weight':
                 l_classif = cross_entropy(cp, ct, weight=class_weight, size_average=False) / N
@@ -287,12 +302,14 @@ def train(*, config='config', resume=False):
                             bt, ct, A, 
                             include_scores=False,
                             image_size=image_size,
+                            variance=cfg['variance'],
                         ))
                         # get predicted boxes
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
                             include_scores=True,
                             image_size=image_size,
+                            variance=cfg['variance'],
                         ))
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # apply non-maximal suppression to predicted boxes
@@ -318,8 +335,6 @@ def train(*, config='config', resume=False):
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
-        #if debug and model.nb_updates % 50 != 0:
-        #    continue
         epoch_time = time.time() - epoch_t0
         if epoch % eval_interval != 0:
             continue
@@ -378,12 +393,14 @@ def train(*, config='config', resume=False):
                             bt, ct, A, 
                             include_scores=False,
                             image_size=image_size,
+                            variance=cfg['variance'],
                         ))
                         # get predicted boxes
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
                             include_scores=True,
                             image_size=image_size,
+                            variance=cfg['variance']
                         ))
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # mAP
@@ -539,6 +556,7 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
             bp, cp, A, 
             image_size=model.image_size,
             include_scores=True,
+            variance=model.config['variance']
         )
         pred_boxes.extend(boxes)
     pred_boxes = non_maximal_suppression_per_class(
@@ -547,10 +565,9 @@ def test(filename, *, model='out/model.th', out=None, cuda=False):
         background_class_id=model.class_to_idx['background'],
         score_threshold=model.config['nms_score_threshold'])
     bgid = model.class_to_idx['background']
-    pred_boxes = [(box, class_id) for box, class_id in pred_boxes if class_id != bgid]
-    pred_boxes = [(box, model.idx_to_class[class_id]) for box, class_id in pred_boxes]
-    for box, name in pred_boxes:
-        print(name)
+    pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
+    idx_to_class = {i: c for c, i in model.class_to_idx.items()}
+    pred_boxes = [(box, idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
     pad = 30
     im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
     im[pad:-pad, pad:-pad] = x
@@ -576,7 +593,7 @@ def find_aspect_ratios(*, config='config', nb=6):
     print(clus.cluster_centers_.flatten().tolist())
 
 
-def draw_anchors(*, config='config', nb=10):
+def draw_anchors(*, config='config', nb=100):
  
     cfg = _read_config(config)
     anchor_list = _build_anchor_list(cfg)
@@ -632,7 +649,8 @@ def _build_dataset(cfg, anchor_list):
             anchor_list=anchor_list,
             iou_threshold=cfg['bbox_encoding_iou_threshold'],
             classes=cfg['classes'],
-            transform=train_transform
+            transform=train_transform,
+            variance=cfg['variance']
         )
         train_dataset = COCO(
             split=train_split,
@@ -660,7 +678,8 @@ def _build_dataset(cfg, anchor_list):
             which=cfg['dataset_version'], 
             iou_threshold=cfg['bbox_encoding_iou_threshold'],
             classes=cfg['classes'],
-            transform=train_transform
+            transform=train_transform,
+            variance=cfg['variance'],
         )
         train_dataset = VOC(
             split='train',

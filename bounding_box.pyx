@@ -17,7 +17,7 @@ def build_anchors(scale=1, feature_map_size=4, offset=0.5, aspect_ratios=(1, 2, 
     for i in range(feature_map_size):
         for j in range(feature_map_size):
             for k, ar in enumerate(aspect_ratios):
-                x = (k + offset) / feature_map_size
+                x = (i + offset) / feature_map_size
                 y = (j + offset) / feature_map_size
                 w = (scale * np.sqrt(ar))
                 h = (scale / np.sqrt(ar))
@@ -79,6 +79,9 @@ cpdef list encode_bounding_box_list_many_to_one(
     # if the best iou > iou_threshold
     for i, anchors in enumerate(anchors_list):
         B, C, M = E[i]
+        nbh = anchors.shape[0]
+        nbw = anchors.shape[1]
+        nbk = anchors.shape[2]
         for ha in range(nbh):
             for wa in range(nbw):
                 for k in range(nbk):
@@ -93,7 +96,7 @@ cpdef list encode_bounding_box_list_many_to_one(
                             continue
                         best_iou = iou_
                         best_bbox = bbox
-                    if M[ha, wa, k] == False:
+                    if M[ha, wa, k] is False:
                         bx, by, bw, bh = best_bbox
                         B[ha, wa, k, X] = ((bx - ax) / aw) / variance[0]
                         B[ha, wa, k, Y] = ((by - ay) / ah) / variance[1]
@@ -102,54 +105,6 @@ cpdef list encode_bounding_box_list_many_to_one(
                         C[ha, wa, k] = class_id if best_iou >= iou_threshold else background_class_id
                         M[ha, wa, k] = best_iou >= iou_threshold
     return E
-
-
-cpdef tuple encode_bounding_box_list_one_to_one(
-    bbox_list, 
-    np.ndarray anchors, 
-    variance=[0.1, 0.1, 0.2, 0.2], 
-    background_class_id=0, 
-    iou_threshold=0.5):
-
-    B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
-    C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
-    C[:] = background_class_id
-    M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
-    cdef int nbh = anchors.shape[0]
-    cdef int nbw = anchors.shape[1]
-    cdef int nbk = anchors.shape[2]
-    cdef float best_iou
-    cdef int best_k
-    cdef int best_wa
-    cdef int best_ha
-    cdef float iou_
-    for (bbox, class_id) in bbox_list:
-        best_iou = 0.
-        best_k = 0
-        best_wa = 0
-        best_ha = 0
-        best_bbox = None
-        for ha in range(nbh):
-            for wa in range(nbw):
-                for k in range(nbk):
-                    anchor = ax, ay, aw, ah = anchors[ha, wa, k]
-                    iou_ = iou(anchor, bbox)
-                    if iou_ >= best_iou:
-                        best_iou = iou_
-                        best_k = k
-                        best_ha = ha
-                        best_wa = wa
-                        best_bbox = ax, ay, aw, ah
-        ax, ay, aw, ah = best_bbox
-        bx, by, bw, bh = bbox
-        
-        B[best_ha, best_wa, best_k, X] = (((bx - ax) / aw)) / variance[0]
-        B[best_ha, best_wa, best_k, Y] = (((by - ay) / ah)) / variance[1]
-        B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
-        B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
-        C[best_ha, best_wa, best_k] = class_id
-        M[best_ha, best_wa, best_k] = True
-    return B, C, M
 
 
 def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 0.2, 0.2], include_scores=False):
@@ -418,14 +373,14 @@ def draw_bounding_boxes(
         y = int(y) + pad
         w = int(w)
         h = int(h)
-        if x > image.shape[1]:
+        if x > image.shape[1] or x < 0:
             continue
         if x + w > image.shape[1]:
+            w = image.shape[1] - x
+        if y > image.shape[0] or y < 0:
             continue
-        if y > image.shape[0]:
-            continue
-        if y + h > image.shape[1]:
-            continue
+        if y + h > image.shape[0]:
+            h = image.shape[0] - y
         image = cv2.rectangle(image, (x, y), (x + w, y + h), color)
         if score:
             text = '{}({:.2f})'.format(class_name, score)

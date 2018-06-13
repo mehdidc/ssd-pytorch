@@ -22,7 +22,9 @@ class DetectionDataset(Dataset):
             bboxes, 
             self.anchor_list, 
             background_class_id=self.background_class_id,
-            iou_threshold=self.iou_threshold)
+            iou_threshold=self.iou_threshold,
+            variance=self.variance,
+        )
         return Y
 
     def _load(self, i):
@@ -83,7 +85,9 @@ class COCO(DetectionDataset):
     def __init__(self, folder='data/coco', anchor_list=[], 
                  split='train2014', iou_threshold=0.5, 
                  data_augmentation_params=None,
-                 classes=None, transform=None, random_state=42):
+                 classes=None, transform=None, 
+                 variance=[0.1, 0.1, 0.2, 0.2],
+                 random_state=42):
         self.folder = folder
         self.anchor_list = anchor_list
         self.annotations_folder = os.path.join(folder, 'annotations')
@@ -94,6 +98,7 @@ class COCO(DetectionDataset):
         self.iou_threshold = iou_threshold
         self.data_augmentation_params = data_augmentation_params
         self.rng = np.random.RandomState(random_state)
+        self.variance = variance
         self._load_annotations()
     
     def _load_annotations(self):
@@ -141,6 +146,7 @@ class VOC(DetectionDataset):
                  which='VOC2007', split='train', 
                  iou_threshold=0.5, data_augmentation_params=None, 
                  classes=None, transform=None, 
+                 variance=[0.1, 0.1, 0.2, 0.2],
                  random_state=42):
         self.folder = folder # root folder, should contain VOC2007 and/or VOC2012
         self.which = which
@@ -152,6 +158,7 @@ class VOC(DetectionDataset):
         self.iou_threshold = iou_threshold
         self.data_augmentation_params = data_augmentation_params
         self.rng = np.random.RandomState(random_state)
+        self.variance = variance
         self._load_annotations()
 
     def _load_annotations(self):
