@@ -56,7 +56,8 @@ def train(*, config='config', resume=False):
     aspect_ratios = cfg['aspect_ratios']
     nms_topk = cfg['nms_topk']
     debug = cfg['debug'] 
-
+    weight_decay = cfg['weight_decay']
+    
     folders = [
         'train', 
         'eval_train', 
@@ -79,7 +80,7 @@ def train(*, config='config', resume=False):
     )
     print('Done loading dataset annotations.')
     if debug:
-        n = 100
+        n = 10
         train_dataset = SubSample(train_dataset, nb=n)
         valid_dataset = SubSample(valid_dataset, nb=n)
         train_evaluation = SubSample(train_evaluation, nb=n)
@@ -163,8 +164,7 @@ def train(*, config='config', resume=False):
         class_weight[0] = neg_weight
         class_weight[1:] = pos_weight
         class_weight = class_weight.cuda()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0, momentum=0.9, weight_decay=5e-4)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0, momentum=0.9, weight_decay=weight_decay)
     #optimizer = torch.optim.Adam(model.parameters(), lr=0)
     #optimizer = torch.optim.RMSprop(model.parameters(), lr=0)
     #step_size = len(train_dataset) // batch_size
@@ -229,7 +229,6 @@ def train(*, config='config', resume=False):
             model.zero_grad()
             loss = w_loc * l_loc + w_classif * l_classif
             loss.backward()
-            #scheduler.batch_step()
             _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
             optimizer.step()
             model.avg_loss = model.avg_loss * gamma + loss.data[0] * (1 - gamma)

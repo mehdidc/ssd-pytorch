@@ -8,7 +8,7 @@ from torchvision.models.resnet import BasicBlock
 
 class SSD_Resnet(nn.Module):
 
-    def __init__(self, num_anchors=[4]*6, num_classes=2, arch='resnet34', fo=64):
+    def __init__(self, num_anchors, num_classes=2, arch='resnet34', fo=64):
         super().__init__()
         assert len(num_anchors) == 6
         self.fo = fo
@@ -73,7 +73,7 @@ class SSD_Resnet(nn.Module):
 
 class SSD_VGG(nn.Module):
 
-    def __init__(self, num_anchors=[4, 4, 4, 4, 4, 4], num_classes=2):
+    def __init__(self, num_anchors, num_classes=2):
         super().__init__()
         assert len(num_anchors) == 6 # 6 scales are proposed in the SSD paper
         # base = from input to conv4_3

@@ -1,4 +1,4 @@
-debug = True 
+debug = False 
 # Model config
 model_name = 'SSD_VGG'
 model_config = {}
@@ -39,9 +39,9 @@ image_size = 300 # image width and height
 gamma = 0.9 # coef for exp. moving average calculation
 mean = [0.485, 0.456, 0.406] # mean of rgb
 std = [0.229, 0.224, 0.225] # std of rgb
-#imbalance_strategy = 'hard_negative_mining'
+imbalance_strategy = 'hard_negative_mining'
 #imbalance_strategy = 'class_weight'
-imbalance_strategy = 'undersampling'
+#imbalance_strategy = 'undersampling'
 # for 'hard_negative_mining' and 'undersampling' imbalance_strategy
 negative_per_positive = 3 
 # for class_weight imbalance strategy
@@ -68,7 +68,9 @@ lr_schedule = [
     {'iter': (30*k, 50*k),  'lr': 0.00001},
     {'iter': (50*k, 100*k), 'lr': 0.000001},
 ]
-log_interval = 10
+weight_decay = 5e-4
+
+log_interval = 50
 eval_interval = 50
 
 # IOU thresholds
@@ -77,4 +79,6 @@ bbox_encoding_iou_threshold = 0.5 # iou threshold used to match true bboxes to a
 nms_iou_threshold = 0.45 # iou threshold used in non maximal suppression
 nms_score_threshold = 0.8 # score threshold when doing non maximal suppression
 nms_topk = 200
+
+# Visualization
 pad = 30
