@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
-from torch.nn.functional import smooth_l1_loss, cross_entropy
+from torch.nn.functional import mse_loss, smooth_l1_loss, cross_entropy
 import model as model_module
 from torchvision.datasets.folder import default_loader
 
@@ -56,7 +56,6 @@ def train(*, config='config', resume=False):
     aspect_ratios = cfg['aspect_ratios']
     nms_topk = cfg['nms_topk']
     debug = cfg['debug'] 
-    weight_decay = cfg['weight_decay']
     
     folders = [
         'train', 
@@ -80,7 +79,7 @@ def train(*, config='config', resume=False):
     )
     print('Done loading dataset annotations.')
     if debug:
-        n = 10
+        n = 100
         train_dataset = SubSample(train_dataset, nb=n)
         valid_dataset = SubSample(valid_dataset, nb=n)
         train_evaluation = SubSample(train_evaluation, nb=n)
@@ -164,11 +163,8 @@ def train(*, config='config', resume=False):
         class_weight[0] = neg_weight
         class_weight[1:] = pos_weight
         class_weight = class_weight.cuda()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0, momentum=0.9, weight_decay=weight_decay)
-    #optimizer = torch.optim.Adam(model.parameters(), lr=0)
-    #optimizer = torch.optim.RMSprop(model.parameters(), lr=0)
-    #step_size = len(train_dataset) // batch_size
-    #scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=6e-3, step_size=step_size * 2)
+    optimizer_cls = getattr(torch.optim, cfg['optim_algo'])
+    optimizer = optimizer_cls(model.parameters(), lr=0, **cfg['optim_params'])
     for epoch in range(first_epoch, num_epoch):
         epoch_t0 = time.time()
         model.train()
@@ -191,7 +187,6 @@ def train(*, config='config', resume=False):
             nb_pos = m.long().sum()
             N = max(nb_pos.data[0], 1.0)
             # localization loss
-            #print(bp.size(), bt.size(), ct.size(), cp.size())
             l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
             # classif loss
             if imbalance_strategy == 'hard_negative_mining':
@@ -204,9 +199,24 @@ def train(*, config='config', resume=False):
                 cp_neg = cp[neg]
                 cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
                 vals, indices = cp_neg_loss.sort(descending=True)
-                nb = len(ct_pos) * negative_per_positive # 3x more neg than pos as in the paper
+                nb = len(ct_pos) * negative_per_positive
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
+                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
+            elif imbalance_strategy == 'hard_negative_mining_with_sampling':
+                ind = torch.arange(len(ct))
+                pos = ind[(ct.data.cpu() > 0)].long().cuda()
+                neg = ind[(ct.data.cpu() == 0)].long().cuda()
+                ct_pos = ct[pos]
+                cp_pos = cp[pos]
+                ct_neg = ct[neg]
+                cp_neg = cp[neg]
+                nb = min(len(ct_pos) * negative_per_positive, len(ct_neg))
+                cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
+                proba_sel = torch.nn.Softmax()(cp_neg_loss)
+                indices = torch.multinomial(proba_sel, nb)
+                cp_neg = cp_neg[indices]
+                ct_neg = ct_neg[indices]
                 l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'undersampling':
                 ind = torch.arange(len(ct))
@@ -226,6 +236,8 @@ def train(*, config='config', resume=False):
                 l_classif = cross_entropy(cp, ct, weight=class_weight, size_average=False) / N
             elif imbalance_strategy == 'nothing':
                 l_classif = cross_entropy(cp, ct, size_average=False) / N
+            else:
+                raise ValueError('unknown imbalance strategy : {}'.format(imbalance_strategy))
             model.zero_grad()
             loss = w_loc * l_loc + w_classif * l_classif
             loss.backward()
@@ -264,11 +276,9 @@ def train(*, config='config', resume=False):
                 X = X.data.cpu().numpy()
                 
                 B = [[b for b, c, m in y] for y in Y]
-                B = [torch.from_numpy(np.array(b)).float() for b in B]
+                B = [(np.array(b)) for b in B]
                 C = [[c for b, c, m in y] for y in Y]
-                C = [torch.from_numpy(np.array(c)).long() for c in C]
-                M = [[m for b, c, m in y] for y in Y]
-                M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
+                C = [(np.array(c)) for c in C]
                 # B contains groundtruth bounding boxes for each scale
                 # C contains groundtruth classes for each scale
                 # M contains the mask for each scale
@@ -304,6 +314,8 @@ def train(*, config='config', resume=False):
                             variance=cfg['variance'],
                         ))
                         # get predicted boxes
+                        #cp[:, :, :, 0] = ct==0
+                        #cp[:, :, :, 1] = ct==1
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
                             include_scores=True,
@@ -334,6 +346,8 @@ def train(*, config='config', resume=False):
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
+        if debug:
+            continue
         epoch_time = time.time() - epoch_t0
         if epoch % eval_interval != 0:
             continue
@@ -450,7 +464,7 @@ def train(*, config='config', resume=False):
                     im_index += 1
 
                 delta = time.time() - tt0
-                print('Eval Batch {:04d}/{:04d} on split {} Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
+                print('Eval Batch {:04d}/{:04d} on split {}, Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
             delta = time.time() - t0
             metrics['eval_' + split_name + '_time'] = [delta]
             print('Eval time of {}: {:.4f}s'.format(split_name, delta))
@@ -514,64 +528,84 @@ def _update_lr(optimizer, nb_iter, schedule):
         g['lr'] = new_lr
 
 
-def test(filename, *, model='out/model.th', out=None, cuda=False):
+def test(filename='test_images', *, model='out/model.th', score_threshold=None, topk=10, out=None, cuda=False):
     if not out:
-        path, ext = filename.split('.', 2)
-        out = path + '_out' + '.' + ext
+        if os.path.isdir(filename):
+            out = 'results'
+        else:
+            path, ext = filename.split('.', 2)
+            out = path + '_out' + '.' + ext
     model = torch.load(model, map_location=lambda storage, loc: storage)
     if cuda:
         model = model.cuda()
     model.eval()
-    im = default_loader(filename)
-    x = model.transform(im)
-    X = x.view(1, x.size(0), x.size(1), x.size(2))
-    if cuda:
-        X = X.cuda()
-    X = Variable(X)
-    Ypred = model(X)
-    BP = [
-        bp.data.cpu().
-        view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).
-        permute(0, 3, 4, 1, 2).
-        numpy() 
-    for bp, cp in Ypred]
-    CP = [
-        cp.data.cpu().
-        view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).
-        permute(0, 3, 4, 1, 2).
-        numpy() 
-    for bp, cp in Ypred]
-    X = X.data.cpu().numpy()
-    x = X[0]
-    x = x.transpose((1, 2, 0))
-    x = x * np.array(model.std) + np.array(model.mean)
-    x = x.astype('float32')
-    pred_boxes = []
-    for j in range(len(Ypred)):
-        cp = CP[j][0]#cl1_score,cl2_score,...
-        bp = BP[j][0]#4
-        A = model.anchor_list[j]
-        boxes = decode_bounding_box_list(
-            bp, cp, A, 
-            image_size=model.image_size,
-            include_scores=True,
-            variance=model.config['variance']
-        )
-        pred_boxes.extend(boxes)
-    pred_boxes = non_maximal_suppression_per_class(
-        pred_boxes, 
-        iou_threshold=model.config['nms_iou_threshold'],
-        background_class_id=model.class_to_idx['background'],
-        score_threshold=model.config['nms_score_threshold'])
-    bgid = model.class_to_idx['background']
-    pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
-    idx_to_class = {i: c for c, i in model.class_to_idx.items()}
-    pred_boxes = [(box, idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
-    pad = 30
-    im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
-    im[pad:-pad, pad:-pad] = x
-    im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
-    imsave(out, x)
+    if os.path.isdir(filename):
+        filenames = [os.path.join(filename, f) for f in os.listdir(filename)]
+    else:
+        filenames = [filename]
+    for filename in filenames:
+        im = default_loader(filename)
+        x = model.transform(im)
+        X = x.view(1, x.size(0), x.size(1), x.size(2))
+        if cuda:
+            X = X.cuda()
+        X = Variable(X)
+        Ypred = model(X)
+        BP = [
+            bp.data.cpu().
+            view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).
+            permute(0, 3, 4, 1, 2).
+            numpy() 
+        for bp, cp in Ypred]
+        CP = [
+            cp.data.cpu().
+            view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).
+            permute(0, 3, 4, 1, 2).
+            numpy() 
+        for bp, cp in Ypred]
+        X = X.data.cpu().numpy()
+        x = X[0]
+        x = x.transpose((1, 2, 0))
+        x = x * np.array(model.std) + np.array(model.mean)
+        x = x.astype('float32')
+        pred_boxes = []
+        for j in range(len(Ypred)):
+            cp = CP[j][0]#cl1_score,cl2_score,...
+            bp = BP[j][0]#4
+            A = model.anchor_list[j]
+            boxes = decode_bounding_box_list(
+                bp, cp, A, 
+                image_size=model.image_size,
+                include_scores=True,
+                variance=model.config['variance']
+            )
+            pred_boxes.extend(boxes)
+        if score_threshold is None:
+            score_threshold = model.config['nms_score_threshold']
+        else:
+            score_threshold = float(score_threshold)
+        pred_boxes = non_maximal_suppression_per_class(
+            pred_boxes, 
+            iou_threshold=model.config['nms_iou_threshold'],
+            background_class_id=model.class_to_idx['background'],
+            score_threshold=score_threshold)
+        bgid = model.class_to_idx['background']
+        pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
+        idx_to_class = {i: c for c, i in model.class_to_idx.items()}
+        pred_boxes = [(box, idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
+        pred_boxes = pred_boxes[0:topk]
+        #for box, class_name, score in pred_boxes:
+        #    print(class_name, score)
+        pad = model.config['pad']
+        im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+        im[pad:-pad, pad:-pad] = x
+        im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+        if os.path.isdir(out):
+            outf = os.path.join(out, os.path.basename(filename))
+        else:
+            outf = out
+        print(outf)
+        imsave(outf, im)
 
 
 def find_aspect_ratios(*, config='config', nb=6):

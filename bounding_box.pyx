@@ -127,7 +127,6 @@ def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 
                 if include_scores is True:
                     scores = C[ha, wa, k]
                     scores = softmax(scores, axis=0)
-                    class_id = np.argmax(scores)
                     bbox_list.append((bbox, scores))
                 else:
                     class_id = C[ha, wa, k]
@@ -232,9 +231,9 @@ def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_thre
         if cl == background_class_id:
             continue
         # consider only bboxes for which the max score corresponds to the current class
-        bb = [(box, scores[cl]) for box, scores in bbox_list if np.argmax(scores) == cl]
+        #bb = [(box, scores[cl]) for box, scores in bbox_list if np.argmax(scores) == cl]
         # consider only bboxes for which the score for the current class exceeds the threshold
-        #bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] >= score_threshold]
+        bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] >= score_threshold]
         bb = non_maximal_suppression(bb, iou_threshold=iou_threshold)
         bb = [(b, cl, score) for (b, score) in bb]
         bblist_all.extend(bb)
@@ -378,11 +377,11 @@ def draw_bounding_boxes(
         xmax = np.clip(xmax, 0, image.shape[1])
         ymin = np.clip(ymin, 0, image.shape[0])
         ymax = np.clip(ymax, 0, image.shape[0])
-
         image = cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color)
         if score:
             text = '{}({:.2f})'.format(class_name, score)
         else:
             text = class_name
+        x, y = np.clip(x, 0, image.shape[1]), np.clip(y, 0, image.shape[0])
         image = cv2.putText(image, text, (x, y), font, font_scale, text_color, 2, cv2.LINE_AA)
     return image
