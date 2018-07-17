@@ -2,12 +2,14 @@ import time
 from collections import defaultdict
 import numpy as np
 import torch
+from torch.autograd import Variable
 import cv2
 from itertools import chain
 from hashlib import md5
 import pandas as pd
-
+from scipy.special import expit as sigmoid
 cimport numpy as np
+from torch.nn.functional import binary_cross_entropy_with_logits as bce
 
 X, Y, W, H = 0, 1, 2, 3
 eps = 1e-10
@@ -37,8 +39,7 @@ cpdef list encode_bounding_box_list_many_to_one(
         B = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2], 4)).astype('float32')
         C = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('int32')
         C[:] = background_class_id
-        M = np.zeros((anchors.shape[0], anchors.shape[1], anchors.shape[2])).astype('bool')
-        E.append((B, C, M)) 
+        E.append((B, C)) 
     if len(bbox_list) == 0:
         return E
     # For each groundtruth box, match the best anchor
@@ -68,17 +69,16 @@ cpdef list encode_bounding_box_list_many_to_one(
                         best_scale = i
         ax, ay, aw, ah = best_bbox
         bx, by, bw, bh = bbox
-        B, C, M = E[best_scale]
+        B, C = E[best_scale]
         B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw) / variance[0]
         B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah) / variance[1]
         B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
         B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
         C[best_ha, best_wa, best_k] = class_id 
-        M[best_ha, best_wa, best_k] = True
     # match each anchor to the groundtruth box with best iou
     # if the best iou > iou_threshold
     for i, anchors in enumerate(anchors_list):
-        B, C, M = E[i]
+        B, C = E[i]
         nbh = anchors.shape[0]
         nbw = anchors.shape[1]
         nbk = anchors.shape[2]
@@ -96,14 +96,13 @@ cpdef list encode_bounding_box_list_many_to_one(
                             continue
                         best_iou = iou_
                         best_bbox = bbox
-                    if M[ha, wa, k] is False:
+                    if C[ha, wa, k] == background_class_id and best_iou >= iou_threshold:
                         bx, by, bw, bh = best_bbox
                         B[ha, wa, k, X] = ((bx - ax) / aw) / variance[0]
                         B[ha, wa, k, Y] = ((by - ay) / ah) / variance[1]
                         B[ha, wa, k, W] = (np.log(eps + bw / aw)) / variance[2]
                         B[ha, wa, k, H] = (np.log(eps + bh / ah)) / variance[3]
-                        C[ha, wa, k] = class_id if best_iou >= iou_threshold else background_class_id
-                        M[ha, wa, k] = best_iou >= iou_threshold
+                        C[ha, wa, k] = class_id
     return E
 
 
@@ -126,7 +125,6 @@ def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 
                 bbox = unnormalize_bounding_box(bbox, (image_size, image_size))
                 if include_scores is True:
                     scores = C[ha, wa, k]
-                    scores = softmax(scores, axis=0)
                     bbox_list.append((bbox, scores))
                 else:
                     class_id = C[ha, wa, k]
@@ -217,11 +215,6 @@ def unnormalize_bounding_box(bbox, size):
     return x, y, w, h
 
 
-def softmax(x, axis=1):
-    e_x = np.exp(x - x.max(axis=axis, keepdims=True))
-    return e_x / e_x.sum(axis=axis, keepdims=True) # only difference"
-
-
 def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_threshold=0.5, score_threshold=0.0):
     bb_scores = bbox_list[0]
     bb, scores = bb_scores
@@ -283,7 +276,9 @@ def average_precision(
     class_id,
     recalls_mAP=np.linspace(0, 1, 11),
     iou_threshold=0.5,
-    score_threshold=0.0):
+    score_threshold=0.0,
+    aggregate=True
+):
     
     # Check 
     #https://medium.com/@jonathan_hui/map-mean-average-precision-for-object-detection-45c121a31173
@@ -304,6 +299,7 @@ def average_precision(
     
     # --- compute precison and recall for each rank
     cdef np.ndarray R = np.zeros(len(bbox_true_list))
+    cdef np.ndarray P = np.zeros(len(bbox_pred_list))
     cdef int nb_precision = 0
     cdef int nb_recall = 0
     precisions = []
@@ -314,7 +310,9 @@ def average_precision(
                 if R[j] == 0:
                     R[j] = 1
                     nb_recall += 1
-                nb_precision += 1
+                if P[i] == 0:
+                    P[i] = 1
+                    nb_precision += 1
         p = nb_precision / (i + 1)
         r = nb_recall / len(bbox_true_list)
         precisions.append(p)
@@ -324,7 +322,10 @@ def average_precision(
     for r in recalls_mAP:
        val = max((precisions[i] for i in range(len(precisions)) if recalls[i] >= r), default=0)
        vals.append(val)
-    return np.mean(vals)
+    if aggregate:
+        return np.mean(vals)
+    else:
+        return vals
 
 
 def matching_matrix(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
@@ -385,3 +386,38 @@ def draw_bounding_boxes(
         x, y = np.clip(x, 0, image.shape[1]), np.clip(y, 0, image.shape[0])
         image = cv2.putText(image, text, (x, y), font, font_scale, text_color, 2, cv2.LINE_AA)
     return image
+
+def get_probas(scores, classif_loss_name, axis=1):
+    if classif_loss_name == 'cross_entropy':
+        return softmax(scores, axis=axis)
+    elif classif_loss_name == 'binary_cross_entropy':
+        return sigmoid(scores) 
+    else:
+        raise ValueError(classif_loss_name)
+
+def softmax(x, axis=1):
+    e_x = np.exp(x - x.max(axis=axis, keepdims=True))
+    return e_x / e_x.sum(axis=axis, keepdims=True)
+
+def binary_cross_entropy_with_logits(ypred, ytrue, reduce=True, **kwargs):
+    if len(ytrue.size()) == 1:
+        ytrue_onehot = np.zeros((ypred.size(0), ypred.size(1)))
+        is_variable = isinstance(ytrue, Variable)
+        if is_variable:
+            ytrue = ytrue.data
+        ytrue = ytrue.cpu().numpy()
+        ytrue_onehot[np.arange(len(ytrue)), ytrue] = 1.0
+        ytrue_onehot = torch.from_numpy(ytrue_onehot).float()
+        if is_variable:
+            ytrue_onehot = Variable(ytrue_onehot)
+        ytrue_onehot = ytrue_onehot.cuda()
+        ypred = ypred.cuda()
+        if reduce is False:
+            # bce does not have a reduce param in pytorch 0.3...
+            # TODO change it when I switch fo pytorch 0.4
+            ypred = torch.nn.Sigmoid()(ypred)
+            return (-(ytrue_onehot * torch.log(ypred + eps) + (1 - ytrue_onehot) * torch.log(1 - ypred + eps))).sum(1)
+        else:
+            return bce(ypred, ytrue_onehot, **kwargs)
+    else:
+        return bce(ypred, ytrue, reduce=reduce, **kwargs)

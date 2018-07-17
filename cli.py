@@ -5,13 +5,14 @@ from collections import defaultdict
 from clize import run
 from skimage.io import imsave
 import pandas as pd
+from sklearn.cluster import KMeans
 
 import torchvision.transforms as transforms
 import torch
 from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
-from torch.nn.functional import mse_loss, smooth_l1_loss, cross_entropy
+from torch.nn.functional import smooth_l1_loss, cross_entropy
 import model as model_module
 from torchvision.datasets.folder import default_loader
 
@@ -28,11 +29,15 @@ from bounding_box import recall
 from bounding_box import build_anchors
 from bounding_box import draw_bounding_boxes
 from bounding_box import average_precision
+from bounding_box import get_probas
+from bounding_box import binary_cross_entropy_with_logits
+
 
 cudnn.benchmark = True
 
 
 def train(*, config='config', resume=False):
+    print('Read config "{}"'.format(config))
     cfg = _read_config(config)
     w_loc = cfg['w_loc']
     w_classif = cfg['w_classif']
@@ -79,7 +84,7 @@ def train(*, config='config', resume=False):
     )
     print('Done loading dataset annotations.')
     if debug:
-        n = 100
+        n = 10
         train_dataset = SubSample(train_dataset, nb=n)
         valid_dataset = SubSample(valid_dataset, nb=n)
         train_evaluation = SubSample(train_evaluation, nb=n)
@@ -116,8 +121,7 @@ def train(*, config='config', resume=False):
     print('Number of classes : {}'.format(nb_classes))
     stats_filename = os.path.join(out_folder, 'stats.csv')
     train_stats_filename = os.path.join(out_folder, 'train_stats.csv')
-    model_filename = os.path.join(out_folder, 'model.th')
-
+    model_filename = os.path.join(out_folder, 'model.th') 
     if resume:
         model = torch.load(model_filename)
         model = model.cuda()
@@ -131,14 +135,31 @@ def train(*, config='config', resume=False):
             train_stats = pd.read_csv(train_stats_filename).to_dict(orient='list')
         else:
             train_stats = defaultdict(list)
+        use_discrete_coords = model.use_discrete_coords
+        coords_discretization = model.coords_discretization
     else:
+        use_discrete_coords = cfg['use_discrete_coords']
+        if use_discrete_coords:
+            coords_discretization = torch.linspace(
+                cfg['discrete_coords_min'], 
+                cfg['discrete_coords_max'],
+                cfg['discrete_coords_nb']
+            )
+            num_coords = 4 * len(coords_discretization) # discretization values for each x,y,w,h
+        else:
+            num_coords = 4
+            coords_discretization = None
         model_class = getattr(model_module, cfg['model_name'])
         kw = cfg.get('model_config', {})
         model = model_class(
             num_anchors=list(map(len, aspect_ratios)), 
             num_classes=nb_classes,
-            **kw     
+            num_coords=num_coords,
+            **kw, 
         )
+        model.use_discrete_coords = use_discrete_coords
+        model.num_coords = num_coords
+        model.coords_discretization = coords_discretization
         model = model.cuda()
         model.transform = valid_dataset.transform 
         model.nb_classes = nb_classes
@@ -158,6 +179,16 @@ def train(*, config='config', resume=False):
         model.std = std
         model.config = cfg
         print(model)
+    
+    classif_loss_name = cfg.get('classif_loss', 'cross_entropy')
+    model.classif_loss_name = classif_loss_name
+    if classif_loss_name == 'cross_entropy':
+        classif_loss = cross_entropy
+    elif classif_loss_name == 'binary_cross_entropy':
+        classif_loss = binary_cross_entropy_with_logits
+    else:
+        raise ValueError('Unknown classif loss : {}'.format(classif_loss_name))
+
     if imbalance_strategy == 'class_weight':
         class_weight = torch.zeros(nb_classes)
         class_weight[0] = neg_weight
@@ -165,12 +196,13 @@ def train(*, config='config', resume=False):
         class_weight = class_weight.cuda()
     optimizer_cls = getattr(torch.optim, cfg['optim_algo'])
     optimizer = optimizer_cls(model.parameters(), lr=0, **cfg['optim_params'])
+    
     for epoch in range(first_epoch, num_epoch):
         epoch_t0 = time.time()
         model.train()
         for batch, samples, in enumerate(train_loader):
             t0 = time.time()
-            X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
+            X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred) = _predict(model, samples)
             # X is batch of image
             # Y is groundtruth output
             # Ypred is predicted output
@@ -178,16 +210,18 @@ def train(*, config='config', resume=False):
             # bbox_pred are predicted bounding boxes extracted from Ypred
             # class_true are groundtruth classes extracted from Y
             # class_pred are predicted classes extracted from Ypred
-            m = masks.view(-1)
+            m = (class_true != bgid).view(-1)
             ind = m.nonzero().view(-1)
             bt = bbox_true
             bp = bbox_pred
             ct = class_true
             cp = class_pred
-            nb_pos = m.long().sum()
-            N = max(nb_pos.data[0], 1.0)
+            N = max(len(ind), 1.0)
             # localization loss
-            l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
+            if use_discrete_coords:
+                l_loc = _discrete_coords_loss(bp[ind], bt[ind], coords_discretization)
+            else:
+                l_loc = smooth_l1_loss(bp[ind], bt[ind], size_average=False) / N
             # classif loss
             if imbalance_strategy == 'hard_negative_mining':
                 ind = torch.arange(len(ct))
@@ -197,12 +231,13 @@ def train(*, config='config', resume=False):
                 cp_pos = cp[pos]
                 ct_neg = ct[neg]
                 cp_neg = cp[neg]
-                cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
+                cp_neg_loss = classif_loss(cp_neg, ct_neg, reduce=False)
+                cp_neg_loss = cp_neg_loss.cuda()
                 vals, indices = cp_neg_loss.sort(descending=True)
                 nb = len(ct_pos) * negative_per_positive
                 cp_neg = cp_neg[indices[0:nb]]
                 ct_neg = ct_neg[indices[0:nb]]
-                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
+                l_classif = (classif_loss(cp_pos, ct_pos, size_average=False) + classif_loss(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'hard_negative_mining_with_sampling':
                 ind = torch.arange(len(ct))
                 pos = ind[(ct.data.cpu() > 0)].long().cuda()
@@ -212,12 +247,13 @@ def train(*, config='config', resume=False):
                 ct_neg = ct[neg]
                 cp_neg = cp[neg]
                 nb = min(len(ct_pos) * negative_per_positive, len(ct_neg))
-                cp_neg_loss = cross_entropy(cp_neg, ct_neg, reduce=False)
-                proba_sel = torch.nn.Softmax()(cp_neg_loss)
+                cp_neg_loss = classif_loss(cp_neg, ct_neg, reduce=False)
+                proba_sel = torch.nn.Softmax(dim=0)(cp_neg_loss)
+                proba_sel = proba_sel.cuda()
                 indices = torch.multinomial(proba_sel, nb)
                 cp_neg = cp_neg[indices]
                 ct_neg = ct_neg[indices]
-                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
+                l_classif = (classif_loss(cp_pos, ct_pos, size_average=False) + classif_loss(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'undersampling':
                 ind = torch.arange(len(ct))
                 pos = ind[(ct.data.cpu() > 0)].long().cuda()
@@ -231,11 +267,11 @@ def train(*, config='config', resume=False):
                 inds = inds.long().cuda()
                 ct_neg = ct_neg[inds]
                 cp_neg = cp_neg[inds]
-                l_classif = (cross_entropy(cp_pos, ct_pos, size_average=False) + cross_entropy(cp_neg, ct_neg, size_average=False)) / N
+                l_classif = (classif_loss(cp_pos, ct_pos, size_average=False) + classif_loss(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'class_weight':
-                l_classif = cross_entropy(cp, ct, weight=class_weight, size_average=False) / N
+                l_classif = classif_loss(cp, ct, weight=class_weight, size_average=False) / N
             elif imbalance_strategy == 'nothing':
-                l_classif = cross_entropy(cp, ct, size_average=False) / N
+                l_classif = classif_loss(cp, ct, size_average=False) / N
             else:
                 raise ValueError('unknown imbalance strategy : {}'.format(imbalance_strategy))
             model.zero_grad()
@@ -275,15 +311,14 @@ def train(*, config='config', resume=False):
                 torch.save(model, model_filename)
                 X = X.data.cpu().numpy()
                 
-                B = [[b for b, c, m in y] for y in Y]
+                B = [[b for b, c in y] for y in Y]
                 B = [(np.array(b)) for b in B]
-                C = [[c for b, c, m in y] for y in Y]
+                C = [[c for b, c in y] for y in Y]
                 C = [(np.array(c)) for c in C]
                 # B contains groundtruth bounding boxes for each scale
                 # C contains groundtruth classes for each scale
-                # M contains the mask for each scale
                 BP = [
-                    bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+                    bp.data.cpu().view(bp.size(0), -1, model.num_coords, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
                 CP = [
                     cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
@@ -305,6 +340,9 @@ def train(*, config='config', resume=False):
                         cp = CP[j][i]#cl1_score,cl2_score,...
                         bt = B[j][i]#4
                         bp = BP[j][i]#4
+                        if use_discrete_coords:
+                            bp = _get_coords(bp, coords_discretization)
+
                         A = model.anchor_list[j]
                         # get groundtruth boxes
                         gt_boxes.extend(decode_bounding_box_list(
@@ -314,8 +352,7 @@ def train(*, config='config', resume=False):
                             variance=cfg['variance'],
                         ))
                         # get predicted boxes
-                        #cp[:, :, :, 0] = ct==0
-                        #cp[:, :, :, 1] = ct==1
+                        cp = get_probas(cp, classif_loss_name, axis=3)
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
                             include_scores=True,
@@ -346,10 +383,10 @@ def train(*, config='config', resume=False):
                 delta = time.time() - t0
                 print('Draw box time {:.4f}s'.format(delta))
             model.nb_updates += 1
-        if debug:
-            continue
         epoch_time = time.time() - epoch_t0
         if epoch % eval_interval != 0:
+            continue
+        if cfg.get('evaluate', True) is False:
             continue
         print('Evaluation') 
         t0 = time.time()
@@ -361,23 +398,19 @@ def train(*, config='config', resume=False):
             im_index = 0
             for batch, samples, in enumerate(loader):
                 tt0 = time.time()
-                X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred), masks = _predict(model, samples)
-
+                X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred) = _predict(model, samples)
                 X = X.data.cpu().numpy()
 
-                B = [[b for b, c, m in y] for y in Y]
+                B = [[b for b, c in y] for y in Y]
                 B = [torch.from_numpy(np.array(b)).float() for b in B]
-                C = [[c for b, c, m in y] for y in Y]
+                C = [[c for b, c in y] for y in Y]
                 C = [torch.from_numpy(np.array(c)).long() for c in C]
-                M = [[m for b, c, m in y] for y in Y]
-                M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
                  
                 # B contains groundtruth bounding boxes for each scale
                 # C contains groundtruth classes for each scale
-                # M contains the mask for each scale
 
                 BP = [
-                    bp.data.cpu().view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+                    bp.data.cpu().view(bp.size(0), -1, model.num_coords, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
                 for bp, cp in Ypred]
                 CP = [
                     cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
@@ -400,6 +433,8 @@ def train(*, config='config', resume=False):
                         cp = CP[j][i]#cl1_score,cl2_score,...
                         bt = B[j][i]#4
                         bp = BP[j][i]#4
+                        if use_discrete_coords:
+                            bp = _get_coords(bp, coords_discretization)
                         A = model.anchor_list[j]
                         # get groundtruth boxes
                         gt_boxes.extend(decode_bounding_box_list(
@@ -409,6 +444,7 @@ def train(*, config='config', resume=False):
                             variance=cfg['variance'],
                         ))
                         # get predicted boxes
+                        cp = get_probas(cp, classif_loss_name, axis=3)
                         pred_boxes.extend(decode_bounding_box_list(
                             bp, cp, A, 
                             include_scores=True,
@@ -417,18 +453,31 @@ def train(*, config='config', resume=False):
                         ))
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
                     # mAP
-                    mAP = []
+                    recalls_mAP = np.linspace(0, 1, 11)
+                    AP_for_recall = defaultdict(list)
+                    AP_for_class = []
                     for class_id in class_ids:
-                        AP = average_precision(
+                        APs = average_precision(
                             pred_boxes, gt_boxes, class_id, 
                             iou_threshold=eval_iou_threshold, 
                             score_threshold=0.0,
+                            recalls_mAP=recalls_mAP,
+                            aggregate=False,
                         )
-                        if AP is not None:
-                            metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
-                            mAP.append(AP)
-                    mAP = np.mean(mAP)
+                        if APs is None:
+                            continue
+                        AP = np.mean(APs)
+                        AP_for_class.append(AP)
+                        metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
+                        for r, ap in zip(recalls_mAP, APs):
+                            m = 'AP(rec_{:.2f})_{}_{}'.format(r, train_dataset.idx_to_class[class_id], split_name)
+                            metrics[m].append(ap)
+                            AP_for_recall[r].append(ap)
+                    mAP = np.mean(AP_for_class)
                     metrics['mAP_' + split_name].append(mAP)
+                    for r in recalls_mAP:
+                        mAP = np.mean(AP_for_recall[r])
+                        metrics['mAP(rec_{:.2f})_{}'.format(r, split_name)].append(mAP)
                     # use the predicted boxes and groundtruth boxes to compute precision and recall
                     pred_boxes = non_maximal_suppression_per_class(
                         pred_boxes, 
@@ -476,6 +525,30 @@ def train(*, config='config', resume=False):
         pd.DataFrame(stats).to_csv(stats_filename, index=False)
         
 
+def _discrete_coords_loss(bp, bt, coords_discretization, **kwargs):
+    # shape of bt: (n_examples, 4)
+    # shape of bp : (n_examples, 4 * len(coords_discretization))
+    c = Variable(coords_discretization.view(1, 1, -1)).cuda()
+    bt = bt.view(bt.size(0), 4, 1)
+    _, btd = torch.abs(bt - c).min(2)
+    bp  = bp.view(bp.size(0) *  4, len(coords_discretization))
+    btd = btd.view(btd.size(0) * 4)
+    return cross_entropy(bp, btd, **kwargs)
+
+
+def _get_coords(bp, coords_discretization):
+    # shape of bp : (h, w, nb_anchors, 4 * len(coords_discretization))
+    bp = torch.from_numpy(bp)
+    bp = bp.contiguous()
+    h, w, nb_anchors = bp.size(0), bp.size(1), bp.size(2)
+    bp = bp.view(h * w * nb_anchors, 4, len(coords_discretization))
+    _, bpd = torch.max(bp, 2)
+    bpd = bpd.view(-1)
+    bpd = coords_discretization[bpd]
+    bpd = bpd.view(h, w, nb_anchors, 4)
+    return bpd.numpy()
+
+
 def _predict(model, samples):
     X = torch.stack([x for x, _, _ in samples], 0) 
     X = X.cuda()
@@ -484,12 +557,10 @@ def _predict(model, samples):
     bbox_encodings = [be for _, _, be in samples]
     Y = list(zip(*bbox_encodings))
     
-    B = [[b for b, c, m in y] for y in Y]
+    B = [[b for b, c in y] for y in Y]
     B = [torch.from_numpy(np.array(b)).float() for b in B]
-    C = [[c for b, c, m in y] for y in Y]
+    C = [[c for b, c in y] for y in Y]
     C = [torch.from_numpy(np.array(c)).long() for c in C]
-    M = [[m for b, c, m in y] for y in Y]
-    M = [torch.from_numpy(np.array(m).astype('uint8')) for m in M]
     bt = [b.view(-1, 4) for b in B]
     bt = torch.cat(bt, 0)
     # B has shape (*, 6)
@@ -497,23 +568,19 @@ def _predict(model, samples):
     ct = [c.view(-1) for c in C]
     ct = torch.cat(ct, 0)
     
-    M = [m.view(-1) for m in M]
-    M = torch.cat(M, 0)
-
     Ypred = model(X)
-    bp = [b.view(b.size(0), -1, 4, b.size(2), b.size(3)).permute(0, 3, 4, 1, 2).contiguous() for b, c in Ypred]
+    bp = [b.view(b.size(0), -1, model.num_coords, b.size(2), b.size(3)).permute(0, 3, 4, 1, 2).contiguous() for b, c in Ypred]
     cp = [c.view(c.size(0), -1, model.nb_classes, c.size(2), c.size(3)).permute(0, 3, 4, 1, 2).contiguous() for b, c in Ypred]    
     
-    bp = [b.view(-1, 4) for b in bp]
+    bp = [b.view(-1, model.num_coords) for b in bp]
     bp = torch.cat(bp, 0)
-    
+
     cp = [c.view(-1, model.nb_classes) for c in cp]
     cp = torch.cat(cp, 0)
 
     ct = Variable(ct).cuda()
     bt = Variable(bt).cuda()
-    M = Variable(M).cuda()
-    return X, (Y, Ypred), (bt, bp), (ct, cp), M
+    return X, (Y, Ypred), (bt, bp), (ct, cp)
 
 
 def _update_lr(optimizer, nb_iter, schedule):
@@ -528,21 +595,26 @@ def _update_lr(optimizer, nb_iter, schedule):
         g['lr'] = new_lr
 
 
-def test(filename='test_images', *, model='out/model.th', score_threshold=None, topk=10, out=None, cuda=False):
-    if not out:
-        if os.path.isdir(filename):
-            out = 'results'
-        else:
-            path, ext = filename.split('.', 2)
-            out = path + '_out' + '.' + ext
+def test(
+    *,
+    in_folder='test_images',
+    out_folder='test_results',
+    model='out/model.th', 
+    score_threshold=None, 
+    topk=10, 
+    iou_threshold=None,
+    background_threshold=0.5,
+    use_nms=True, 
+    out=None, 
+    cuda=False,
+):
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
     model = torch.load(model, map_location=lambda storage, loc: storage)
     if cuda:
         model = model.cuda()
     model.eval()
-    if os.path.isdir(filename):
-        filenames = [os.path.join(filename, f) for f in os.listdir(filename)]
-    else:
-        filenames = [filename]
+    filenames = [os.path.join(in_folder, f) for f in os.listdir(in_folder)]
     for filename in filenames:
         im = default_loader(filename)
         x = model.transform(im)
@@ -553,7 +625,7 @@ def test(filename='test_images', *, model='out/model.th', score_threshold=None, 
         Ypred = model(X)
         BP = [
             bp.data.cpu().
-            view(bp.size(0), -1, 4, bp.size(2), bp.size(3)).
+            view(bp.size(0), -1, model.num_coords, bp.size(2), bp.size(3)).
             permute(0, 3, 4, 1, 2).
             numpy() 
         for bp, cp in Ypred]
@@ -572,7 +644,10 @@ def test(filename='test_images', *, model='out/model.th', score_threshold=None, 
         for j in range(len(Ypred)):
             cp = CP[j][0]#cl1_score,cl2_score,...
             bp = BP[j][0]#4
+            if model.use_discrete_coords:
+                bp = _get_coords(bp, model.coords_discretization)
             A = model.anchor_list[j]
+            cp = get_probas(cp, model.classif_loss_name, axis=3)
             boxes = decode_bounding_box_list(
                 bp, cp, A, 
                 image_size=model.image_size,
@@ -584,32 +659,46 @@ def test(filename='test_images', *, model='out/model.th', score_threshold=None, 
             score_threshold = model.config['nms_score_threshold']
         else:
             score_threshold = float(score_threshold)
-        pred_boxes = non_maximal_suppression_per_class(
-            pred_boxes, 
-            iou_threshold=model.config['nms_iou_threshold'],
-            background_class_id=model.class_to_idx['background'],
-            score_threshold=score_threshold)
+        if iou_threshold is None:
+            iou_threshold = model.config['nms_iou_threshold']
+        else:
+            iou_threshold = float(iou_threshold)
         bgid = model.class_to_idx['background']
-        pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
         idx_to_class = {i: c for c, i in model.class_to_idx.items()}
+        
+        if use_nms:
+            pred_boxes = non_maximal_suppression_per_class(
+                pred_boxes, 
+                iou_threshold=iou_threshold,
+                background_class_id=bgid,
+                score_threshold=score_threshold
+            )
+        else:
+            def get_box(box, scores):
+                bg_score = scores[0]
+                if bg_score >= background_threshold:
+                    return box, 0, bg_score
+                else:
+                    cl= 1 + scores[1:].argmax()
+                    score = scores[1:].max()
+                    return box, cl, score
+            pred_boxes = [get_box(box, scores) for box, scores in pred_boxes]
+        pred_boxes = sorted(pred_boxes, key=lambda p:p[2], reverse=True)
+        pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
         pred_boxes = [(box, idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
         pred_boxes = pred_boxes[0:topk]
-        #for box, class_name, score in pred_boxes:
-        #    print(class_name, score)
+        for box, class_name, score in pred_boxes:
+            print(class_name, score)
         pad = model.config['pad']
         im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
         im[pad:-pad, pad:-pad] = x
         im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
-        if os.path.isdir(out):
-            outf = os.path.join(out, os.path.basename(filename))
-        else:
-            outf = out
+        outf = os.path.join(out_folder, os.path.basename(filename))
         print(outf)
         imsave(outf, im)
 
 
 def find_aspect_ratios(*, config='config', nb=6):
-    from sklearn.cluster import KMeans
     cfg = _read_config(config)
     anchor_list = _build_anchor_list(cfg)
     (dataset, _), _ = _build_dataset(cfg, anchor_list)
@@ -631,6 +720,8 @@ def draw_anchors(*, config='config', nb=100):
     cfg = _read_config(config)
     anchor_list = _build_anchor_list(cfg)
     (dataset, _), _ = _build_dataset(cfg, anchor_list)
+    bgid = dataset.class_to_idx['background']
+
     mean = cfg['mean']
     std = cfg['std']
     image_size = cfg['image_size']
@@ -646,9 +737,9 @@ def draw_anchors(*, config='config', nb=100):
         x = x.astype('float32')
         anchor_boxes = []
         for j, e in enumerate(encoding):
-            B, C, M = e
+            B, C = e
             A = anchor_list[j]
-            hcoords, wcoords, k_id = np.where(M)
+            hcoords, wcoords, k_id = np.where(B != bgid)
             for h, w, k in zip(hcoords, wcoords, k_id):
                 a = image_size * A[h, w, k]
                 a = a.tolist()
@@ -754,6 +845,97 @@ def _read_config(config):
     exec(open(config).read(), {}, cfg)
     return cfg
 
+def sample_hypers_and_train(config_template):
+    content = open(config_template).read()
+    name, config = _generate_config_from_template(content)
+    config_file = 'configs/{}'.format(name)
+    with open(config_file, 'w') as fd:
+        fd.write(config)
+    train(config=config_file)
+
+
+def _generate_config_from_template(content):
+    from jinja2 import Template
+    import uuid
+    rng = np.random.RandomState()
+    name = str(uuid.uuid4())
+    out_folder = '"results/{}"'.format(name)
+    tpl = Template(content)
+
+    algo = rng.choice(('"Adam"', '"SGD"'))
+    if algo == '"SGD"':
+        algo_params = {'momentum': 0.9, 'weight_decay': rng.choice((0, 1e-4, 3e-4))}
+    elif algo == '"Adam"':
+        algo_params = {}
+    algo_params = str(algo_params)
+    model_name = rng.choice(('"SSD_VGG"', '"SSD_Resnet"'))
+    batch_size = 8
+    use_discrete_coords = rng.choice((True, False))
+    imbalance_strategy = rng.choice((
+        'hard_negative_mining_with_sampling',
+        'hard_negative_mining',
+        'nothing',
+        'undersampling',
+    ))
+    imbalance_strategy = '"{}"'.format(imbalance_strategy)
+    if model_name == '"SSD_Resnet"':
+        arch = rng.choice(('resnet18', 'resnet34', 'resnet50'))
+        model_config = {'arch': arch}
+        model_config = str(model_config)
+        print(model_config)
+        batch_size = 1
+    else:
+        model_config = {}
+    classif_loss = rng.choice(('"cross_entropy"', '"binary_cross_entropy"'))
+    params = {
+        'w_loc': rng.choice((1, 2, 0.5, 0.1)),
+        'w_classif': 1,
+        'use_discrete_coords': use_discrete_coords,
+        'negative_per_positive': rng.choice((1, 2, 3, 5, 10)),
+        'pos_weight': 1,
+        'neg_weight': 0.1,
+        'out_folder': out_folder,
+        'lr_init': rng.choice((0.1, 0.01, 0.001, 0.0001)),
+        'optim_algo': algo,
+        'optim_params': algo_params,
+        'batch_size': batch_size,
+        'model_name': model_name,
+        'model_config': model_config,
+        'imbalance_strategy': imbalance_strategy,
+        'classif_loss': classif_loss,
+        'patch_proba': rng.choice((0, 0.1, 0.3, 0.5)),
+        'flip_proba': rng.choice((0, 0.1, 0.3, 0.5)),
+    }
+    res = tpl.render(**params)
+    return name, res
+
+
+def leaderboard():
+    from glob import glob
+    filenames = glob('results/**/stats.csv')
+    rows = []
+    for filename in filenames:
+        name = os.path.basename(os.path.dirname(filename))
+        df = pd.read_csv(filename)
+        d = df.iloc[-1].to_dict()
+        d['name'] = name[0:10]
+        rows.append(d)
+    df = pd.DataFrame(rows)
+    df = df[[
+        'name',
+        'epoch',
+        'mAP_train',
+        'mAP_valid',
+        'precision_train',
+        'precision_valid',
+        'recall_train',
+        'recall_valid',
+    ]]
+    df = df.round(decimals=2)
+    pd.options.display.width = 200
+    df = df.sort_values(by='mAP_valid', ascending=False)
+    print(df)
+
 
 if __name__ == '__main__':
-    run([train, test, draw_anchors, find_aspect_ratios])
+    run([train, test, draw_anchors, find_aspect_ratios, sample_hypers_and_train, leaderboard])

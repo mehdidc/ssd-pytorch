@@ -8,7 +8,7 @@ from torchvision.models.resnet import BasicBlock
 
 class SSD_Resnet(nn.Module):
 
-    def __init__(self, num_anchors, num_classes=2, arch='resnet34', fo=64):
+    def __init__(self, num_anchors, num_coords=4, num_classes=2, arch='resnet34', fo=64):
         super().__init__()
         assert len(num_anchors) == 6
         self.fo = fo
@@ -31,22 +31,22 @@ class SSD_Resnet(nn.Module):
             f_in = [512, 1024, 2048, fi, fo, fo]
         else:
             raise ValueError('Architecture {} not supported'.format(arch))
-        self.out1b = nn.Conv2d(f_in[0], num_anchors[0] * 4, kernel_size=3, padding=1)
+        self.out1b = nn.Conv2d(f_in[0], num_anchors[0] * num_coords, kernel_size=3, padding=1)
         self.out1c = nn.Conv2d(f_in[0], num_anchors[0] * num_classes, kernel_size=3, padding=1)
         
-        self.out2b = nn.Conv2d(f_in[1], num_anchors[1] * 4, kernel_size=3, padding=1)
+        self.out2b = nn.Conv2d(f_in[1], num_anchors[1] * num_coords, kernel_size=3, padding=1)
         self.out2c = nn.Conv2d(f_in[1], num_anchors[1] * num_classes, kernel_size=3, padding=1)
         
-        self.out3b = nn.Conv2d(f_in[2], num_anchors[2] * 4, kernel_size=3, padding=1)
+        self.out3b = nn.Conv2d(f_in[2], num_anchors[2] * num_coords, kernel_size=3, padding=1)
         self.out3c = nn.Conv2d(f_in[2], num_anchors[2] * num_classes, kernel_size=3, padding=1)
  
-        self.out4b = nn.Conv2d(f_in[3], num_anchors[3] * 4, kernel_size=3, padding=1)
+        self.out4b = nn.Conv2d(f_in[3], num_anchors[3] * num_coords, kernel_size=3, padding=1)
         self.out4c = nn.Conv2d(f_in[3], num_anchors[3] * num_classes, kernel_size=3, padding=1)
         
-        self.out5b = nn.Conv2d(f_in[4], num_anchors[4] * 4, kernel_size=3, padding=1)
+        self.out5b = nn.Conv2d(f_in[4], num_anchors[4] * num_coords, kernel_size=3, padding=1)
         self.out5c = nn.Conv2d(f_in[4],  num_anchors[4] * num_classes, kernel_size=3, padding=1)
         
-        self.out6b = nn.Conv2d(f_in[5], num_anchors[5] * 4, kernel_size=3, padding=1)
+        self.out6b = nn.Conv2d(f_in[5], num_anchors[5] * num_coords, kernel_size=3, padding=1)
         self.out6c = nn.Conv2d(f_in[5], num_anchors[5] * num_classes, kernel_size=3, padding=1)
 
     def forward(self, x):
@@ -73,7 +73,7 @@ class SSD_Resnet(nn.Module):
 
 class SSD_VGG(nn.Module):
 
-    def __init__(self, num_anchors, num_classes=2):
+    def __init__(self, num_anchors, num_coords=4, num_classes=2):
         super().__init__()
         assert len(num_anchors) == 6 # 6 scales are proposed in the SSD paper
         # base = from input to conv4_3
@@ -168,41 +168,41 @@ class SSD_VGG(nn.Module):
             #nn.BatchNorm2d(256),
             nn.ReLU(True)
         )
-        self.out1b = nn.Conv2d(512, num_anchors[0] * 4, kernel_size=3, padding=1)
+        self.out1b = nn.Conv2d(512, num_anchors[0] * num_coords, kernel_size=3, padding=1)
         self.out1c = nn.Conv2d(512, num_anchors[0] * num_classes, kernel_size=3, padding=1)
         
-        self.out2b = nn.Conv2d(512, num_anchors[1] * 4, kernel_size=3, padding=1)
+        self.out2b = nn.Conv2d(512, num_anchors[1] * num_coords, kernel_size=3, padding=1)
         self.out2c = nn.Conv2d(512, num_anchors[1] * num_classes, kernel_size=3, padding=1)
         
-        self.out3b = nn.Conv2d(256, num_anchors[2] * 4, kernel_size=3, padding=1)
+        self.out3b = nn.Conv2d(256, num_anchors[2] * num_coords, kernel_size=3, padding=1)
         self.out3c = nn.Conv2d(256, num_anchors[2] * num_classes, kernel_size=3, padding=1)
  
-        self.out4b = nn.Conv2d(256, num_anchors[3] * 4, kernel_size=3, padding=1)
+        self.out4b = nn.Conv2d(256, num_anchors[3] * num_coords, kernel_size=3, padding=1)
         self.out4c = nn.Conv2d(256, num_anchors[3] * num_classes, kernel_size=3, padding=1)
         
-        self.out5b = nn.Conv2d(256, num_anchors[4] * 4, kernel_size=3, padding=1)
+        self.out5b = nn.Conv2d(256, num_anchors[4] * num_coords, kernel_size=3, padding=1)
         self.out5c = nn.Conv2d(256, num_anchors[4] * num_classes, kernel_size=3, padding=1)
         
-        self.out6b = nn.Conv2d(256, num_anchors[5] * 4, kernel_size=3, padding=1)
+        self.out6b = nn.Conv2d(256, num_anchors[5] * num_coords, kernel_size=3, padding=1)
         self.out6c = nn.Conv2d(256, num_anchors[5] * num_classes, kernel_size=3, padding=1)
 
         S = 20
-        self.norm1b = L2Norm(num_anchors[0] * 4, S)
+        self.norm1b = L2Norm(num_anchors[0] * num_coords, S)
         self.norm1c = L2Norm(num_anchors[0] * num_classes, S)
         
-        self.norm2b = L2Norm(num_anchors[1] * 4, S)
+        self.norm2b = L2Norm(num_anchors[1] * num_coords, S)
         self.norm2c = L2Norm(num_anchors[1] * num_classes, S)
         
-        self.norm3b = L2Norm(num_anchors[2] * 4, S)
+        self.norm3b = L2Norm(num_anchors[2] * num_coords, S)
         self.norm3c = L2Norm(num_anchors[2] * num_classes, S)
  
-        self.norm4b = L2Norm(num_anchors[3] * 4, S)
+        self.norm4b = L2Norm(num_anchors[3] * num_coords, S)
         self.norm4c = L2Norm(num_anchors[3] * num_classes, S)
  
-        self.norm5b = L2Norm(num_anchors[4] * 4, S)
+        self.norm5b = L2Norm(num_anchors[4] * num_coords, S)
         self.norm5c = L2Norm(num_anchors[4] * num_classes, S)
 
-        self.norm6b = L2Norm(num_anchors[5] * 4, S)
+        self.norm6b = L2Norm(num_anchors[5] * num_coords, S)
         self.norm6c = L2Norm(num_anchors[5] * num_classes, S)
         self.apply(weights_init)
         # pretrained weights

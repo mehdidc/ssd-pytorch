@@ -1,0 +1,84 @@
+debug = False 
+model_name = {{model_name}}
+model_config = {{model_config}}
+if model_name == 'SSD_VGG':
+    feature_map_sizes = [37, 19, 10, 5, 3, 1]
+    scales = [0.15, 0.3 , 0.45, 0.6, 0.75, 0.9]
+elif model_name == 'SSD_Resnet':
+    feature_map_sizes = [38, 19, 10, 5, 3, 2]
+    scales = [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]
+else:
+    raise ValueError(model_name)
+offset = 0.5
+aspect_ratios = [[1, 2, 3, 1/2, 1/3]] * len(feature_map_sizes)
+variance = [1, 1, 1, 1]
+# Data Config
+
+dataset = 'VOC'
+dataset_root_folder = 'data/voc'
+dataset_version = 'VOC0712'
+classes = ['person']
+
+# Training
+
+w_loc = {{w_loc}}
+w_classif = {{w_classif}}
+
+batch_size = {{batch_size}}
+num_epoch = 10000 # total number of epochs
+image_size = 300 # image width and height
+gamma = 0.9 # coef for exp. moving average calculation
+mean = [0.485, 0.456, 0.406] # mean of rgb
+std = [0.229, 0.224, 0.225] # std of rgb
+
+use_discrete_coords = {{use_discrete_coords}}
+discrete_coords_min = -2
+discrete_coords_max = 2
+discrete_coords_nb = 100
+
+imbalance_strategy = {{imbalance_strategy}}
+negative_per_positive = {{negative_per_positive}}
+pos_weight = {{pos_weight}}
+neg_weight = {{neg_weight}}
+
+out_folder = {{out_folder}}
+
+num_workers = 8 # num of workers for loading data
+
+data_augmentation_params = {
+    'patch_proba': {{patch_proba}},
+    'min_scale': 0.1, # minimum patch width
+    'max_scale': 1, # maximum patch width
+    'min_aspect_ratio': 0.5, # min patch aspect ratio
+    'max_aspect_ratio': 2, # max patch aspect ratio
+    'nb_trials': 50, # nb of trials for patch sampling until we find a patch with at least one bbox
+    'flip_proba': {{flip_proba}}, # proba of flipping
+}
+train_evaluation_size = 500
+val_evaluation_size = 500
+k = 1000
+
+lr_init = {{lr_init}}
+g = 10.
+lr_schedule = [
+    {'iter': (0,    30*k),  'lr': lr_init},
+    {'iter': (30*k, 50*k),  'lr': lr_init / g},
+    {'iter': (50*k, 100*k), 'lr': lr_init / g**2},
+]
+optim_algo = {{optim_algo}}
+optim_params = {{optim_params}}
+classif_loss = {{classif_loss}}
+
+log_interval = 50
+eval_interval = 10
+
+
+# thresholds
+eval_iou_threshold = 0.5
+bbox_encoding_iou_threshold = 0.5 # iou threshold used to match true bboxes to anchor boxes
+nms_iou_threshold = 0.5 # iou threshold used in non maximal suppression
+nms_score_threshold = 0.5 # score threshold when doing non maximal suppression
+nms_topk = 10
+
+# Visualization
+pad = 30
