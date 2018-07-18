@@ -150,14 +150,18 @@ def train(*, config='config', resume=False):
         else:
             num_coords = 4
             coords_discretization = None
-        model_class = getattr(model_module, cfg['model_name'])
-        kw = cfg.get('model_config', {})
-        model = model_class(
-            num_anchors=list(map(len, aspect_ratios)), 
-            num_classes=nb_classes,
-            num_coords=num_coords,
-            **kw, 
-        )
+        if 'init_from' in cfg:
+            print('Init from {}'.format(cfg['init_from']))
+            model = torch.load(cfg['init_from'])
+        else:
+            model_class = getattr(model_module, cfg['model_name'])
+            kw = cfg.get('model_config', {})
+            model = model_class(
+                num_anchors=list(map(len, aspect_ratios)), 
+                num_classes=nb_classes,
+                num_coords=num_coords,
+                **kw, 
+            )
         model.use_discrete_coords = use_discrete_coords
         model.num_coords = num_coords
         model.coords_discretization = coords_discretization
