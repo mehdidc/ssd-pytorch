@@ -98,10 +98,17 @@ cpdef list encode_bounding_box_list_many_to_one(
                         best_bbox = bbox
                     if C[ha, wa, k] == background_class_id and best_iou >= iou_threshold:
                         bx, by, bw, bh = best_bbox
-                        B[ha, wa, k, X] = ((bx - ax) / aw) / variance[0]
-                        B[ha, wa, k, Y] = ((by - ay) / ah) / variance[1]
-                        B[ha, wa, k, W] = (np.log(eps + bw / aw)) / variance[2]
-                        B[ha, wa, k, H] = (np.log(eps + bh / ah)) / variance[3]
+                        x = ((bx - ax) / aw) / variance[0]
+                        y = ((by - ay) / ah) / variance[1]
+                        w = (np.log(eps + bw / aw)) / variance[2]
+                        h = (np.log(eps + bh / ah)) / variance[3]
+                        if np.isnan(w) or np.isnan(h) or np.isnan(x) or np.isnan(y):
+                            import pdb
+                            pdb.set_trace()
+                        B[ha, wa, k, X] = x
+                        B[ha, wa, k, Y] = y
+                        B[ha, wa, k, W] = w
+                        B[ha, wa, k, H] = h 
                         C[ha, wa, k] = class_id
     return E
 
