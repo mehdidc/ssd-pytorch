@@ -150,6 +150,8 @@ class WIDER(DetectionDataset):
                  data_augmentation_params=None, 
                  transform=None, 
                  variance=[0.1, 0.1, 0.2, 0.2],
+                 min_box_w=10,
+                 min_box_h=10,
                  random_state=42):
         self.folder = folder
         self.anchor_list = anchor_list
@@ -160,6 +162,8 @@ class WIDER(DetectionDataset):
         self.data_augmentation_params = data_augmentation_params
         self.rng = np.random.RandomState(random_state)
         self.variance = variance
+        self.min_box_w = min_box_w
+        self.min_box_h = min_box_h
         self._load_annotations()
 
     def _load_annotations(self):
@@ -190,10 +194,11 @@ class WIDER(DetectionDataset):
                     y = float(y)
                     w = float(w)
                     h = float(h)
-                    print(x, y, w, h)
                     box = (x, y, w, h), 'person'
-                    bboxes.append(box)
-                anns.append((filename, bboxes))
+                    if w >= self.min_box_w and h >= self.min_box_h:
+                        bboxes.append(box)
+                if len(bboxes):
+                    anns.append((filename, bboxes))
         self.rng.shuffle(anns)
         self.filenames = [fname for fname, bboxes in anns]
         self.boxes = [bboxes for fname, bboxes in anns]
