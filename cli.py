@@ -18,6 +18,7 @@ from torchvision.datasets.folder import default_loader
 
 from dataset import COCO
 from dataset import VOC
+from dataset import WIDER
 from dataset import SubSample
 
 
@@ -179,7 +180,6 @@ def train(*, config='config', resume=False):
         model.std = std
         model.config = cfg
         print(model)
-    
     classif_loss_name = cfg.get('classif_loss', 'cross_entropy')
     model.classif_loss_name = classif_loss_name
     if classif_loss_name == 'cross_entropy':
@@ -269,6 +269,8 @@ def train(*, config='config', resume=False):
                 cp_neg = cp_neg[inds]
                 l_classif = (classif_loss(cp_pos, ct_pos, size_average=False) + classif_loss(cp_neg, ct_neg, size_average=False)) / N
             elif imbalance_strategy == 'class_weight':
+                # TODO make it work if classif_loss is "binary_cross_entropy", it does not
+                # work in that case
                 l_classif = classif_loss(cp, ct, weight=class_weight, size_average=False) / N
             elif imbalance_strategy == 'nothing':
                 l_classif = classif_loss(cp, ct, size_average=False) / N
@@ -824,6 +826,33 @@ def _build_dataset(cfg, anchor_list):
             valid_dataset, 
             nb=cfg['val_evaluation_size']
         )
+    elif dataset == 'WIDER':
+        kwargs = dict(
+            folder=cfg['dataset_root_folder'],
+            anchor_list=anchor_list, 
+            iou_threshold=cfg['bbox_encoding_iou_threshold'],
+            transform=train_transform,
+            variance=cfg['variance'],
+        )
+        train_dataset = WIDER(
+            split='train',
+            data_augmentation_params=cfg['data_augmentation_params'],
+            **kwargs,
+        )
+        valid_dataset = WIDER(
+            split='val',
+            data_augmentation_params={},
+            **kwargs,
+        )
+        train_evaluation = SubSample(WIDER(
+            split='train',
+            data_augmentation_params={},
+            **kwargs
+        ), nb=cfg['train_evaluation_size'])
+        valid_evaluation = SubSample(
+            valid_dataset, 
+            nb=cfg['val_evaluation_size']
+        ) 
     else:
         raise ValueError('Unknown dataset {}'.format(dataset))
     return (train_dataset, valid_dataset), (train_evaluation, valid_evaluation)
@@ -926,6 +955,8 @@ def leaderboard():
         'epoch',
         'mAP_train',
         'mAP_valid',
+        'mAP(rec_0.90)_train',
+        'mAP(rec_0.90)_valid',
         'precision_train',
         'precision_valid',
         'recall_train',

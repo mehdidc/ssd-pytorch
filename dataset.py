@@ -141,6 +141,67 @@ class COCO(DetectionDataset):
         self.filenames = [os.path.join(self.folder, self.split,  f) for f in self.filenames]
 
 
+class WIDER(DetectionDataset):
+    
+    def __init__(self, folder='data/wider', 
+                 anchor_list=[], 
+                 split='train', 
+                 iou_threshold=0.5, 
+                 data_augmentation_params=None, 
+                 transform=None, 
+                 variance=[0.1, 0.1, 0.2, 0.2],
+                 random_state=42):
+        self.folder = folder
+        self.anchor_list = anchor_list
+        self.split = split
+        self.transform = transform
+        self.background_class_id = 0
+        self.iou_threshold = iou_threshold
+        self.data_augmentation_params = data_augmentation_params
+        self.rng = np.random.RandomState(random_state)
+        self.variance = variance
+        self._load_annotations()
+
+    def _load_annotations(self):
+        images_folder = os.path.join(
+            self.folder, 
+            'WIDER_{}'.format(self.split), 
+            'images'
+        )
+        annotation_file = os.path.join(
+            self.folder, 
+            'wider_face_split', 
+            'wider_face_{}_bbx_gt.txt'.format(self.split)
+        )
+        anns = []
+        with open(annotation_file) as fd:
+            while True:
+                f = fd.readline().strip()
+                if f == '':
+                    break
+                filename = os.path.join(images_folder, f)
+                nb_boxes = int(fd.readline().strip())
+                bboxes = []
+                for i in range(nb_boxes):
+                    line = fd.readline().strip()
+                    toks = line.split(' ')
+                    x, y, w, h, *rest = toks
+                    x = float(x)
+                    y = float(y)
+                    w = float(w)
+                    h = float(h)
+                    print(x, y, w, h)
+                    box = (x, y, w, h), 'person'
+                    bboxes.append(box)
+                anns.append((filename, bboxes))
+        self.rng.shuffle(anns)
+        self.filenames = [fname for fname, bboxes in anns]
+        self.boxes = [bboxes for fname, bboxes in anns]
+        self.classes = ['person']
+        self.class_to_idx = {'background': 0, 'person': 1}
+        self.idx_to_class = {0: 'background', 1: 'person'}
+
+
 class VOC(DetectionDataset):
     def __init__(self, folder='data/voc', anchor_list=[], 
                  which='VOC2007', split='train', 
