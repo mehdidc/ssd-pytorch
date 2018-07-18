@@ -948,19 +948,25 @@ def leaderboard():
         df = pd.read_csv(filename)
         d = df.iloc[-1].to_dict()
         d['name'] = name[0:10]
+        try:
+            cfg = _read_config(os.path.join('configs', name))
+            d['model'] = cfg['model_name']
+        except Exception:
+            d['model'] = ''
         rows.append(d)
     df = pd.DataFrame(rows)
     df = df[[
         'name',
         'epoch',
+        'model',
         'mAP_train',
         'mAP_valid',
-        'mAP(rec_0.90)_train',
-        'mAP(rec_0.90)_valid',
-        'precision_train',
-        'precision_valid',
-        'recall_train',
-        'recall_valid',
+        #'mAP(rec_0.90)_train',
+        #'mAP(rec_0.90)_valid',
+        #'precision_train',
+        #'precision_valid',
+        #'recall_train',
+        #'recall_valid',
     ]]
     df = df.round(decimals=2)
     pd.options.display.width = 200

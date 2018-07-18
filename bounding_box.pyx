@@ -70,10 +70,19 @@ cpdef list encode_bounding_box_list_many_to_one(
         ax, ay, aw, ah = best_bbox
         bx, by, bw, bh = bbox
         B, C = E[best_scale]
-        B[best_ha, best_wa, best_k, X] = ((bx - ax) / aw) / variance[0]
-        B[best_ha, best_wa, best_k, Y] = ((by - ay) / ah) / variance[1]
-        B[best_ha, best_wa, best_k, W] = (np.log(eps + bw / aw)) / variance[2]
-        B[best_ha, best_wa, best_k, H] = (np.log(eps + bh / ah)) / variance[3]
+        
+        x = ((bx - ax) / aw) / variance[0]
+        y = ((by - ay) / ah) / variance[1]
+        w = (np.log(eps + bw / aw)) / variance[2]
+        h = (np.log(eps + bh / ah)) / variance[3]
+        if np.isnan(w) or np.isnan(h) or np.isnan(x) or np.isnan(y):
+            print(bw, bh, aw, ah, w, h)
+            import pdb
+            pdb.set_trace()
+        B[best_ha, best_wa, best_k, X] = x
+        B[best_ha, best_wa, best_k, Y] = y
+        B[best_ha, best_wa, best_k, W] = w
+        B[best_ha, best_wa, best_k, H] = h
         C[best_ha, best_wa, best_k] = class_id 
     # match each anchor to the groundtruth box with best iou
     # if the best iou > iou_threshold
@@ -103,6 +112,7 @@ cpdef list encode_bounding_box_list_many_to_one(
                         w = (np.log(eps + bw / aw)) / variance[2]
                         h = (np.log(eps + bh / ah)) / variance[3]
                         if np.isnan(w) or np.isnan(h) or np.isnan(x) or np.isnan(y):
+                            print(bw, bh, aw, ah, w, h)
                             import pdb
                             pdb.set_trace()
                         B[ha, wa, k, X] = x
