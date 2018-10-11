@@ -82,16 +82,18 @@ class DetectionDataset(Dataset):
 
 
 class COCO(DetectionDataset):
-    def __init__(self, folder='data/coco', anchor_list=[], 
-                 split='train2014', iou_threshold=0.5, 
+    def __init__(self, 
+                 anchor_list=[], 
+                 annotations='coco/annotations/instances_train.json', 
+                 images_folder='coco/images/train',
+                 iou_threshold=0.5, 
                  data_augmentation_params=None,
                  classes=None, transform=None, 
                  variance=[0.1, 0.1, 0.2, 0.2],
                  random_state=42):
-        self.folder = folder
         self.anchor_list = anchor_list
-        self.annotations_folder = os.path.join(folder, 'annotations')
-        self.split = split
+        self.annotations = annotations
+        self.images_folder = images_folder
         self.transform = transform
         self.classes = classes
         self.background_class_id = 0
@@ -102,11 +104,10 @@ class COCO(DetectionDataset):
         self._load_annotations()
     
     def _load_annotations(self):
-        A = json.load(open(os.path.join(self.annotations_folder, 'instances_{}.json'.format(self.split))))
-        B = json.load(open(os.path.join(self.annotations_folder, 'captions_{}.json'.format(self.split))))
+        A = json.load(open(self.annotations))
         class_id_name = {a['id']: a['name'] for a in A['categories']}
         image_id_to_filename = {}
-        for b in B['images']:
+        for b in A['images']:
             image_id_to_filename[b['id']] = b['file_name']
         keys = list(image_id_to_filename.keys())
         keys = sorted(keys)
@@ -138,7 +139,7 @@ class COCO(DetectionDataset):
         indexes = list(index_to_filename.keys())
         self.boxes = [B[ind] for ind in indexes if len(B[ind]) > 0]
         self.filenames = [index_to_filename[ind] for ind in indexes if len(B[ind]) > 0]
-        self.filenames = [os.path.join(self.folder, self.split,  f) for f in self.filenames]
+        self.filenames = [os.path.join(self.images_folder,  f) for f in self.filenames]
 
 
 class WIDER(DetectionDataset):

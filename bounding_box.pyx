@@ -405,7 +405,7 @@ def draw_bounding_boxes(
     return image
 
 def get_probas(scores, classif_loss_name, axis=1):
-    if classif_loss_name == 'cross_entropy':
+    if classif_loss_name in ('cross_entropy', 'focal_loss'):
         return softmax(scores, axis=axis)
     elif classif_loss_name == 'binary_cross_entropy':
         return sigmoid(scores) 

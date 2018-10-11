@@ -33,6 +33,7 @@ from bounding_box import average_precision
 from bounding_box import get_probas
 from bounding_box import binary_cross_entropy_with_logits
 
+from optim import FocalLoss
 
 cudnn.benchmark = True
 
@@ -190,6 +191,11 @@ def train(*, config='config', resume=False):
         classif_loss = cross_entropy
     elif classif_loss_name == 'binary_cross_entropy':
         classif_loss = binary_cross_entropy_with_logits
+    elif classif_loss_name == 'focal_loss':
+        classif_loss = FocalLoss(
+            gamma=cfg.get('focal_loss_gamma', 2),
+            alpha=cfg.get('focal_loss_alpha', None),
+        )
     else:
         raise ValueError('Unknown classif loss : {}'.format(classif_loss_name))
 
@@ -612,8 +618,7 @@ def test(
     background_threshold=0.5,
     use_nms=True, 
     out=None, 
-    cuda=False,
-):
+    cuda=False):
     if not os.path.exists(out_folder):
         os.makedirs(out_folder)
     model = torch.load(model, map_location=lambda storage, loc: storage)
@@ -721,7 +726,7 @@ def find_aspect_ratios(*, config='config', nb=6):
     print(clus.cluster_centers_.flatten().tolist())
 
 
-def draw_anchors(*, config='config', nb=100):
+def draw_anchors(*, config='config', nb=100, only_groundtruth=False):
  
     cfg = _read_config(config)
     anchor_list = _build_anchor_list(cfg)
@@ -742,16 +747,17 @@ def draw_anchors(*, config='config', nb=100):
         x = x * np.array(std) + np.array(mean)
         x = x.astype('float32')
         anchor_boxes = []
-        for j, e in enumerate(encoding):
-            B, C = e
-            A = anchor_list[j]
-            hcoords, wcoords, k_id = np.where(B != bgid)
-            for h, w, k in zip(hcoords, wcoords, k_id):
-                a = image_size * A[h, w, k]
-                a = a.tolist()
-                c = C[h, w, k]
-                c = dataset.idx_to_class[c]
-                anchor_boxes.append((a, c))
+        if not only_groundtruth:
+            for j, e in enumerate(encoding):
+                B, C = e
+                A = anchor_list[j]
+                hcoords, wcoords, k_id = np.where(C != bgid)
+                for h, w, k in zip(hcoords, wcoords, k_id):
+                    a = image_size * A[h, w, k]
+                    a = a.tolist()
+                    c = C[h, w, k]
+                    c = dataset.idx_to_class[c]
+                    anchor_boxes.append((a, c))
         pad = 100
         im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
         im[pad:-pad, pad:-pad] = x
@@ -772,10 +778,11 @@ def _build_dataset(cfg, anchor_list):
     ])
     dataset = cfg['dataset']
     if dataset == 'COCO':
-        train_split = 'train' + str(cfg['dataset_version'])
-        val_split = 'val' + str(cfg['dataset_version'])
+        train_annotations = cfg['dataset_train_annotations'] 
+        val_annotations = cfg['dataset_valid_annotations']
+        train_folder = cfg['dataset_train_images_folder']
+        val_folder = cfg['dataset_valid_images_folder']
         kwargs = dict(
-            folder=cfg['dataset_root_folder'],
             anchor_list=anchor_list,
             iou_threshold=cfg['bbox_encoding_iou_threshold'],
             classes=cfg['classes'],
@@ -783,17 +790,20 @@ def _build_dataset(cfg, anchor_list):
             variance=cfg['variance']
         )
         train_dataset = COCO(
-            split=train_split,
+            annotations=train_annotations,
+            images_folder=train_folder,
             data_augmentation_params=cfg['data_augmentation_params'],
             **kwargs
         )
         valid_dataset = COCO(
-            split=val_split,
+            annotations=val_annotations,
+            images_folder=val_folder,
             data_augmentation_params={},
             **kwargs,
         )
         train_evaluation = SubSample(COCO(
-            split=train_split,
+            annotations=train_annotations,
+            images_folder=train_folder,
             data_augmentation_params={},
             **kwargs,
         ), nb=cfg['train_evaluation_size'])
