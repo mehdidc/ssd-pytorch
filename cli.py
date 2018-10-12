@@ -973,9 +973,9 @@ def _generate_config_from_template(content):
     return name, res
 
 
-def leaderboard():
+def leaderboard(folder='results'):
     from glob import glob
-    filenames = glob('results/**/stats.csv')
+    filenames = glob(os.path.join(folder, '**', 'stats.csv'))
     rows = []
     for filename in filenames:
         name = os.path.basename(os.path.dirname(filename))
@@ -1007,11 +1007,93 @@ def leaderboard():
     df = df.sort_values(by='mAP_valid', ascending=False)
     print(df)
 
+
+def sample_hypers_and_train(config_template):
+    content = open(config_template).read()
+    folder = os.path.basename(config_template)
+    name, config = _generate_config_from_template(folder, content)
+    config_file = 'configs/{}/{}'.format(folder, name)
+    with open(config_file, 'w') as fd:
+        fd.write(config)
+    train(config=config_file)
+
+
+def _generate_config_from_template(root_folder_name, content):
+    from jinja2 import Template
+    import uuid
+    rng = np.random.RandomState()
+    name = str(uuid.uuid4())
+    out_folder = '"results/{}/{}"'.format(root_folder_name, name)
+    tpl = Template(content)
+
+    algo = rng.choice(('"Adam"', '"SGD"'))
+    if algo == '"SGD"':
+        algo_params = {'momentum': 0.9, 'weight_decay': rng.choice((0, 1e-4, 3e-4))}
+    elif algo == '"Adam"':
+        algo_params = {}
+    algo_params = str(algo_params)
+    model_name = rng.choice(('"SSD_VGG"', '"SSD_Resnet"'))
+    batch_size = 16
+    use_discrete_coords = rng.choice((True, False))
+    imbalance_strategy = rng.choice((
+        'hard_negative_mining_with_sampling',
+        'hard_negative_mining',
+        'nothing',
+        'undersampling',
+        'none',
+    ))
+    imbalance_strategy = '"{}"'.format(imbalance_strategy)
+    if model_name == '"SSD_Resnet"':
+        arch = rng.choice(('resnet18', 'resnet34', 'resnet50'))
+        model_config = {'arch': arch}
+        model_config = str(model_config)
+        print(model_config)
+        batch_size = 1
+    else:
+        model_config = {}
+    classif_loss = rng.choice((
+        '"cross_entropy"', 
+        '"binary_cross_entropy"', 
+        '"focal_loss"'
+    ))
+    params = {
+        'w_loc': rng.choice((1, 2, 0.5, 0.1)),
+        'w_classif': 1,
+        'use_discrete_coords': use_discrete_coords,
+        'negative_per_positive': rng.choice((1, 2, 3, 5, 10)),
+        'pos_weight': 1,
+        'neg_weight': 0.1,
+        'out_folder': out_folder,
+        'lr_init': rng.choice((0.1, 0.01, 0.001, 0.0001)),
+        'optim_algo': algo,
+        'optim_params': algo_params,
+        'batch_size': batch_size,
+        'model_name': model_name,
+        'model_config': model_config,
+        'imbalance_strategy': imbalance_strategy,
+        'classif_loss': classif_loss,
+        'patch_proba': rng.choice((0, 0.1, 0.3, 0.5)),
+        'flip_proba': rng.choice((0, 0.1, 0.3, 0.5)),
+    }
+    res = tpl.render(**params)
+    return name, res
+
+
+
+
 def item(x):
     if hasattr(x, 'item'):
         return x.item()
     else:
         return float(x.data[0])
 
+
 if __name__ == '__main__':
-    run([train, test, draw_anchors, find_aspect_ratios, sample_hypers_and_train, leaderboard])
+    run([
+        train, 
+        test, 
+        draw_anchors, 
+        find_aspect_ratios, 
+        leaderboard, 
+        sample_hypers_and_train
+    ])

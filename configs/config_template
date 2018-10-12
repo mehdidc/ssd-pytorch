@@ -43,7 +43,7 @@ neg_weight = {{neg_weight}}
 
 out_folder = {{out_folder}}
 
-num_workers = 8 # num of workers for loading data
+num_workers = 4 # num of workers for loading data
 
 data_augmentation_params = {
     'patch_proba': {{patch_proba}},
@@ -79,6 +79,7 @@ bbox_encoding_iou_threshold = 0.5 # iou threshold used to match true bboxes to a
 nms_iou_threshold = 0.5 # iou threshold used in non maximal suppression
 nms_score_threshold = 0.5 # score threshold when doing non maximal suppression
 nms_topk = 10
+use_nms = True
 
 # Visualization
 pad = 30
