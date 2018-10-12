@@ -995,12 +995,10 @@ def leaderboard(folder='results'):
         'model',
         'mAP_train',
         'mAP_valid',
-        #'mAP(rec_0.90)_train',
-        #'mAP(rec_0.90)_valid',
-        'precision_train',
-        'precision_valid',
-        'recall_train',
-        'recall_valid',
+        #'precision_train',
+        #'precision_valid',
+        #'recall_train',
+        #'recall_valid',
     ]]
     df = df.round(decimals=2)
     pd.options.display.width = 200
