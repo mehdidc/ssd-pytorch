@@ -144,7 +144,7 @@ def decode_bounding_box_list(B, C, anchors, image_size=300 ,variance=[0.1, 0.1, 
                     scores = C[ha, wa, k]
                     bbox_list.append((bbox, scores))
                 else:
-                    class_id = C[ha, wa, k]
+                    class_id = int(C[ha, wa, k])
                     bbox_list.append((bbox, class_id))
     return bbox_list 
 
@@ -240,8 +240,6 @@ def non_maximal_suppression_per_class(bbox_list, background_class_id=0, iou_thre
     for cl in range(nb_classes):
         if cl == background_class_id:
             continue
-        # consider only bboxes for which the max score corresponds to the current class
-        #bb = [(box, scores[cl]) for box, scores in bbox_list if np.argmax(scores) == cl]
         # consider only bboxes for which the score for the current class exceeds the threshold
         bb = [(box, scores[cl]) for box, scores in bbox_list if scores[cl] >= score_threshold]
         bb = non_maximal_suppression(bb, iou_threshold=iou_threshold)
@@ -289,11 +287,9 @@ def recall(bbox_pred_list, bbox_true_list, iou_threshold=0.5):
     return (M.sum(axis=0) > 0).astype('float32').mean()
 
 def average_precision(
-    bbox_pred_list_with_scores, bbox_true_list, 
-    class_id,
+    bbox_pred_list, bbox_true_list, 
     recalls_mAP=np.linspace(0, 1, 11),
     iou_threshold=0.5,
-    score_threshold=0.0,
     aggregate=True
 ):
     
@@ -303,14 +299,11 @@ def average_precision(
 
     # -- get prediction list of bboxes 
     def score_fn(k):
-        bbox, scores = k
-        score = scores[class_id]
+        bbox, im_index, score = k
         return score
-    bbox_pred_list_with_scores = sorted(bbox_pred_list_with_scores, key=score_fn, reverse=True)
-    bbox_pred_list = [bbox for bbox, scores in bbox_pred_list_with_scores if scores[class_id] >= score_threshold]
+    bbox_pred_list = sorted(bbox_pred_list, key=score_fn, reverse=True)
     
     # --- get true list of bboxes
-    bbox_true_list = [bbox for (bbox, cl) in bbox_true_list if cl == class_id]
     if len(bbox_true_list) == 0:
         return None
     
@@ -321,15 +314,18 @@ def average_precision(
     cdef int nb_recall = 0
     precisions = []
     recalls = []
-    for i, bbox_pred in enumerate(bbox_pred_list):
-        for j, bbox_true in enumerate(bbox_true_list):
-            if iou(bbox_pred, bbox_true) >= iou_threshold:
-                if R[j] == 0:
-                    R[j] = 1
-                    nb_recall += 1
-                if P[i] == 0:
-                    P[i] = 1
-                    nb_precision += 1
+    for i, (bbox_pred, im_index_pred, _) in enumerate(bbox_pred_list):
+        for j, (bbox_true, im_index_true) in enumerate(bbox_true_list):
+            if im_index_pred != im_index_true:
+                continue
+            if iou(bbox_pred, bbox_true) < iou_threshold:
+                continue
+            if R[j] == 0:
+                R[j] = 1
+                nb_recall += 1
+            if P[i] == 0:
+                P[i] = 1
+                nb_precision += 1
         p = nb_precision / (i + 1)
         r = nb_recall / len(bbox_true_list)
         precisions.append(p)

@@ -25,6 +25,7 @@ from dataset import SubSample
 import pyximport; pyximport.install()
 from bounding_box import decode_bounding_box_list
 from bounding_box import non_maximal_suppression_per_class
+from bounding_box import non_maximal_suppression
 from bounding_box import precision
 from bounding_box import recall
 from bounding_box import build_anchors
@@ -291,9 +292,9 @@ def train(*, config='config', resume=False):
             loss.backward()
             _update_lr(optimizer, model.nb_updates, cfg['lr_schedule'])
             optimizer.step()
-            model.avg_loss = model.avg_loss * gamma + loss.data[0] * (1 - gamma)
-            model.avg_loc = model.avg_loc * gamma  + l_loc.data[0] * (1 - gamma)
-            model.avg_classif = model.avg_classif * gamma + l_classif.data[0] * (1 - gamma)
+            model.avg_loss = model.avg_loss * gamma + item(loss) * (1 - gamma)
+            model.avg_loc = model.avg_loc * gamma  + item(l_loc) * (1 - gamma)
+            model.avg_classif = model.avg_classif * gamma + item(l_classif) * (1 - gamma)
             delta = time.time() - t0
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
                   'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} '
@@ -302,17 +303,17 @@ def train(*, config='config', resume=False):
                       num_epoch,
                       batch + 1, 
                       len(train_loader), 
-                      loss.data[0], 
-                      l_loc.data[0],
-                      l_classif.data[0],
+                      item(loss), 
+                      item(l_loc),
+                      item(l_classif),
                       model.avg_loss,
                       model.avg_loc,
                       model.avg_classif,
                       delta
                     ))
-            train_stats['loss'].append(loss.data[0])
-            train_stats['loc'].append(l_loc.data[0])
-            train_stats['classif'].append(l_classif.data[0])
+            train_stats['loss'].append(item(loss))
+            train_stats['loc'].append(item(l_loc))
+            train_stats['classif'].append(item(l_classif))
             train_stats['time'].append(delta)
 
             if model.nb_updates % log_interval == 0:
@@ -376,12 +377,18 @@ def train(*, config='config', resume=False):
                     # 1) for each class, filter low confidence predictions and then do NMS
                     # 2) concat all the bboxes from all classes
                     # 3) take to the topk (nms_topk)
-                    pred_boxes = non_maximal_suppression_per_class(
-                        pred_boxes, 
-                        background_class_id=bgid,
-                        iou_threshold=nms_iou_threshold,
-                        score_threshold=nms_score_threshold)
-                    pred_boxes = pred_boxes[0:nms_topk]
+                    if cfg['use_nms']:
+                        pred_boxes = non_maximal_suppression_per_class(
+                            pred_boxes, 
+                            background_class_id=bgid,
+                            iou_threshold=nms_iou_threshold,
+                            score_threshold=nms_score_threshold)
+                        pred_boxes = pred_boxes[0:nms_topk]
+                    else:
+                        pred_boxes = [
+                            (box, scores.argmax(), scores.max()) 
+                            for box, scores in pred_boxes if scores.argmax() != bgid and scores.max() > nms_score_threshold
+                        ]
                     # get class names
                     gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
                     pred_boxes = [(box, train_dataset.idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
@@ -408,6 +415,8 @@ def train(*, config='config', resume=False):
         for split_name, loader in (('train', train_evaluation_loader), ('valid', valid_evaluation_loader)):
             t0 = time.time()
             im_index = 0
+            all_gt_boxes = defaultdict(list)
+            all_pred_boxes = defaultdict(list)
             for batch, samples, in enumerate(loader):
                 tt0 = time.time()
                 X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred) = _predict(model, samples)
@@ -431,9 +440,10 @@ def train(*, config='config', resume=False):
                 # BP contains predicted bounding boxes for each scale
                 # CP contains predicted classes for each scale
                 for i in range(len(X)):
-                    # for each example i  in mini-batch
                     gt_boxes = []
                     pred_boxes = []
+                    pred_boxes_per_class = defaultdict(list)
+                    # for each example i  in mini-batch
                     x = X[i]
                     x = x.transpose((1, 2, 0))
                     x = x * np.array(std) + np.array(mean)
@@ -464,39 +474,21 @@ def train(*, config='config', resume=False):
                             variance=cfg['variance']
                         ))
                     gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
-                    # mAP
-                    recalls_mAP = np.linspace(0, 1, 11)
-                    AP_for_recall = defaultdict(list)
-                    AP_for_class = []
                     for class_id in class_ids:
-                        APs = average_precision(
-                            pred_boxes, gt_boxes, class_id, 
-                            iou_threshold=eval_iou_threshold, 
-                            score_threshold=0.0,
-                            recalls_mAP=recalls_mAP,
-                            aggregate=False,
+                        all_gt_boxes[class_id].extend([
+                            (box, im_index) 
+                            for box, box_class_id in gt_boxes if class_id == box_class_id]
                         )
-                        if APs is None:
-                            continue
-                        AP = np.mean(APs)
-                        AP_for_class.append(AP)
-                        metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
-                        for r, ap in zip(recalls_mAP, APs):
-                            m = 'AP(rec_{:.2f})_{}_{}'.format(r, train_dataset.idx_to_class[class_id], split_name)
-                            metrics[m].append(ap)
-                            AP_for_recall[r].append(ap)
-                    mAP = np.mean(AP_for_class)
-                    metrics['mAP_' + split_name].append(mAP)
-                    for r in recalls_mAP:
-                        mAP = np.mean(AP_for_recall[r])
-                        metrics['mAP(rec_{:.2f})_{}'.format(r, split_name)].append(mAP)
                     # use the predicted boxes and groundtruth boxes to compute precision and recall
+                    # PER image
                     pred_boxes = non_maximal_suppression_per_class(
                         pred_boxes, 
                         background_class_id=bgid,
                         iou_threshold=nms_iou_threshold,
-                        score_threshold=nms_score_threshold
+                        score_threshold=nms_score_threshold,
                     )
+                    for box, class_id, score in pred_boxes:
+                        all_pred_boxes[class_id].append((box, im_index, score))
                     pred_boxes = pred_boxes[0:nms_topk]
                     P = []
                     R = []
@@ -526,6 +518,34 @@ def train(*, config='config', resume=False):
 
                 delta = time.time() - tt0
                 print('Eval Batch {:04d}/{:04d} on split {}, Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
+            # mAP
+            print('Compute mAP...')
+            t0_ap = time.time()
+            recalls_mAP = np.linspace(0, 1, 11)
+            AP_for_recall = defaultdict(list)
+            AP_for_class = []
+            for class_id in class_ids:
+                APs = average_precision(
+                    all_pred_boxes[class_id], all_gt_boxes[class_id], 
+                    iou_threshold=eval_iou_threshold, 
+                    recalls_mAP=recalls_mAP,
+                    aggregate=False,
+                )
+                if APs is None:
+                    continue
+                AP = np.mean(APs)
+                AP_for_class.append(AP)
+                metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
+                for r, ap in zip(recalls_mAP, APs):
+                    m = 'AP(rec_{:.2f})_{}_{}'.format(r, train_dataset.idx_to_class[class_id], split_name)
+                    metrics[m].append(ap)
+                    AP_for_recall[r].append(ap)
+            mAP = np.mean(AP_for_class)
+            metrics['mAP_' + split_name].append(mAP)
+            for r in recalls_mAP:
+                mAP = np.mean(AP_for_recall[r])
+                metrics['mAP(rec_{:.2f})_{}'.format(r, split_name)].append(mAP)
+            print('mAP computing time : {:.3f}'.format(time.time() - t0_ap))
             delta = time.time() - t0
             metrics['eval_' + split_name + '_time'] = [delta]
             print('Eval time of {}: {:.4f}s'.format(split_name, delta))
@@ -977,16 +997,21 @@ def leaderboard():
         'mAP_valid',
         #'mAP(rec_0.90)_train',
         #'mAP(rec_0.90)_valid',
-        #'precision_train',
-        #'precision_valid',
-        #'recall_train',
-        #'recall_valid',
+        'precision_train',
+        'precision_valid',
+        'recall_train',
+        'recall_valid',
     ]]
     df = df.round(decimals=2)
     pd.options.display.width = 200
     df = df.sort_values(by='mAP_valid', ascending=False)
     print(df)
 
+def item(x):
+    if hasattr(x, 'item'):
+        return x.item()
+    else:
+        return float(x.data[0])
 
 if __name__ == '__main__':
     run([train, test, draw_anchors, find_aspect_ratios, sample_hypers_and_train, leaderboard])
