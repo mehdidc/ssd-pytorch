@@ -25,7 +25,6 @@ from dataset import SubSample
 import pyximport; pyximport.install()
 from bounding_box import decode_bounding_box_list
 from bounding_box import non_maximal_suppression_per_class
-from bounding_box import non_maximal_suppression
 from bounding_box import precision
 from bounding_box import recall
 from bounding_box import build_anchors
@@ -125,21 +124,32 @@ def train(*, config='config', resume=False):
     stats_filename = os.path.join(out_folder, 'stats.csv')
     train_stats_filename = os.path.join(out_folder, 'train_stats.csv')
     model_filename = os.path.join(out_folder, 'model.th') 
+    optimizer_filename = os.path.join(out_folder, 'optimizer.th')
+
     if resume:
+        print('Resuming model: {}'.format(model_filename))
         model = torch.load(model_filename)
         model = model.cuda()
+        if os.path.exists(optimizer_filename):
+            print('Resuming optimizer: {}'.format(optimizer_filename))
+            optimizer = torch.load(optimizer_filename)
+        else:
+            optimizer_cls = getattr(torch.optim, cfg['optim_algo'])
+            optimizer = optimizer_cls(model.parameters(), lr=0, **cfg['optim_params'])
+
         if os.path.exists(stats_filename):
             stats = pd.read_csv(stats_filename).to_dict(orient='list')
-            first_epoch = max(stats['epoch']) + 1
+            first_epoch = max(stats['epoch'])
         else:
             stats = defaultdict(list)
-            first_epoch = 0
+            first_epoch = 1
         if os.path.exists(train_stats_filename):
             train_stats = pd.read_csv(train_stats_filename).to_dict(orient='list')
         else:
             train_stats = defaultdict(list)
         use_discrete_coords = model.use_discrete_coords
         coords_discretization = model.coords_discretization
+        print('Starting from epoch {}'.format(first_epoch))
     else:
         use_discrete_coords = cfg['use_discrete_coords']
         if use_discrete_coords:
@@ -164,6 +174,9 @@ def train(*, config='config', resume=False):
                 num_coords=num_coords,
                 **kw, 
             )
+            optimizer_cls = getattr(torch.optim, cfg['optim_algo'])
+            optimizer = optimizer_cls(model.parameters(), lr=0, **cfg['optim_params'])
+         
         model.use_discrete_coords = use_discrete_coords
         model.num_coords = num_coords
         model.coords_discretization = coords_discretization
@@ -173,7 +186,7 @@ def train(*, config='config', resume=False):
         model.aspect_ratios = aspect_ratios
         model.anchor_list = anchor_list
         model.image_size = image_size
-        first_epoch = 0
+        first_epoch = 1
         stats = defaultdict(list)
         train_stats = defaultdict(list)
         model.nb_updates = 0
@@ -205,9 +218,7 @@ def train(*, config='config', resume=False):
         class_weight[0] = neg_weight
         class_weight[1:] = pos_weight
         class_weight = class_weight.cuda()
-    optimizer_cls = getattr(torch.optim, cfg['optim_algo'])
-    optimizer = optimizer_cls(model.parameters(), lr=0, **cfg['optim_params'])
-    
+   
     for epoch in range(first_epoch, num_epoch):
         epoch_t0 = time.time()
         model.train()
@@ -299,7 +310,7 @@ def train(*, config='config', resume=False):
             print('Epoch {:05d}/{:05d} Batch {:05d}/{:05d} Loss : {:.3f} Loc : {:.3f} '
                   'Classif : {:.3f} AvgTrainLoss : {:.3f} AvgLoc : {:.3f} '
                   'AvgClassif {:.3f} Time:{:.3f}s'.format(
-                      epoch + 1,
+                      epoch,
                       num_epoch,
                       batch + 1, 
                       len(train_loader), 
@@ -322,6 +333,7 @@ def train(*, config='config', resume=False):
                 pd.DataFrame(train_stats).to_csv(train_stats_filename, index=False)
                 t0 = time.time()
                 torch.save(model, model_filename)
+                torch.save(optimizer, optimizer_filename)
                 X = X.data.cpu().numpy()
                 
                 B = [[b for b, c in y] for y in Y]
@@ -354,8 +366,7 @@ def train(*, config='config', resume=False):
                         bt = B[j][i]#4
                         bp = BP[j][i]#4
                         if use_discrete_coords:
-                            bp = _get_coords(bp, coords_discretization)
-
+                            bp = _get_coords(bp, model.coords_discretization)
                         A = model.anchor_list[j]
                         # get groundtruth boxes
                         gt_boxes.extend(decode_bounding_box_list(
@@ -407,155 +418,189 @@ def train(*, config='config', resume=False):
             continue
         if cfg.get('evaluate', True) is False:
             continue
-        print('Evaluation') 
-        t0 = time.time()
-        model.eval()
-        metrics = defaultdict(list)
-        metrics['train_time'] = [epoch_time]
-        for split_name, loader in (('train', train_evaluation_loader), ('valid', valid_evaluation_loader)):
-            t0 = time.time()
-            im_index = 0
-            all_gt_boxes = defaultdict(list)
-            all_pred_boxes = defaultdict(list)
-            for batch, samples, in enumerate(loader):
-                tt0 = time.time()
-                X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred) = _predict(model, samples)
-                X = X.data.cpu().numpy()
-
-                B = [[b for b, c in y] for y in Y]
-                B = [torch.from_numpy(np.array(b)).float() for b in B]
-                C = [[c for b, c in y] for y in Y]
-                C = [torch.from_numpy(np.array(c)).long() for c in C]
-                 
-                # B contains groundtruth bounding boxes for each scale
-                # C contains groundtruth classes for each scale
-
-                BP = [
-                    bp.data.cpu().view(bp.size(0), -1, model.num_coords, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
-                for bp, cp in Ypred]
-                CP = [
-                    cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
-                for bp, cp in Ypred]
-
-                # BP contains predicted bounding boxes for each scale
-                # CP contains predicted classes for each scale
-                for i in range(len(X)):
-                    gt_boxes = []
-                    pred_boxes = []
-                    pred_boxes_per_class = defaultdict(list)
-                    # for each example i  in mini-batch
-                    x = X[i]
-                    x = x.transpose((1, 2, 0))
-                    x = x * np.array(std) + np.array(mean)
-                    x = x.astype('float32')
-
-                    for j in range(len(Y)):
-                        # for each scale j
-                        ct = C[j][i]# class_id
-                        cp = CP[j][i]#cl1_score,cl2_score,...
-                        bt = B[j][i]#4
-                        bp = BP[j][i]#4
-                        if use_discrete_coords:
-                            bp = _get_coords(bp, coords_discretization)
-                        A = model.anchor_list[j]
-                        # get groundtruth boxes
-                        gt_boxes.extend(decode_bounding_box_list(
-                            bt, ct, A, 
-                            include_scores=False,
-                            image_size=image_size,
-                            variance=cfg['variance'],
-                        ))
-                        # get predicted boxes
-                        cp = get_probas(cp, classif_loss_name, axis=3)
-                        pred_boxes.extend(decode_bounding_box_list(
-                            bp, cp, A, 
-                            include_scores=True,
-                            image_size=image_size,
-                            variance=cfg['variance']
-                        ))
-                    gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
-                    for class_id in class_ids:
-                        all_gt_boxes[class_id].extend([
-                            (box, im_index) 
-                            for box, box_class_id in gt_boxes if class_id == box_class_id]
-                        )
-                    # use the predicted boxes and groundtruth boxes to compute precision and recall
-                    # PER image
-                    pred_boxes = non_maximal_suppression_per_class(
-                        pred_boxes, 
-                        background_class_id=bgid,
-                        iou_threshold=nms_iou_threshold,
-                        score_threshold=nms_score_threshold,
-                    )
-                    for box, class_id, score in pred_boxes:
-                        all_pred_boxes[class_id].append((box, im_index, score))
-                    pred_boxes = pred_boxes[0:nms_topk]
-                    P = []
-                    R = []
-                    for class_id in class_ids:
-                        t = [box for box, cl in gt_boxes if cl == class_id]
-                        if len(t) == 0:
-                            continue
-                        p = [box for box, cl, score in pred_boxes if cl == class_id]
-                        prec = precision(p, t, iou_threshold=eval_iou_threshold)
-                        re = recall(p, t, iou_threshold=eval_iou_threshold)
-                        metrics['precision_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(prec)
-                        metrics['recall_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(re)
-                        P.append(prec)
-                        R.append(re)
-                    metrics['precision_' + split_name].append(np.mean(P))
-                    metrics['recall_' + split_name].append(np.mean(R))
-                    gt_boxes = [(box, train_dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
-                    pred_boxes = [(box, train_dataset.idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
-                    # draw boxes
-                    pad = cfg['pad']
-                    im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
-                    im[pad:-pad, pad:-pad] = x
-                    im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
-                    im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
-                    imsave(os.path.join(out_folder, 'eval_{}'.format(split_name), 'sample_{:05d}.jpg'.format(im_index)), im)
-                    im_index += 1
-
-                delta = time.time() - tt0
-                print('Eval Batch {:04d}/{:04d} on split {}, Time : {:.3f}s'.format(batch, len(loader), split_name, delta))
-            # mAP
-            print('Compute mAP...')
-            t0_ap = time.time()
-            recalls_mAP = np.linspace(0, 1, 11)
-            AP_for_recall = defaultdict(list)
-            AP_for_class = []
-            for class_id in class_ids:
-                APs = average_precision(
-                    all_pred_boxes[class_id], all_gt_boxes[class_id], 
-                    iou_threshold=eval_iou_threshold, 
-                    recalls_mAP=recalls_mAP,
-                    aggregate=False,
-                )
-                if APs is None:
-                    continue
-                AP = np.mean(APs)
-                AP_for_class.append(AP)
-                metrics['AP_' + train_dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
-                for r, ap in zip(recalls_mAP, APs):
-                    m = 'AP(rec_{:.2f})_{}_{}'.format(r, train_dataset.idx_to_class[class_id], split_name)
-                    metrics[m].append(ap)
-                    AP_for_recall[r].append(ap)
-            mAP = np.mean(AP_for_class)
-            metrics['mAP_' + split_name].append(mAP)
-            for r in recalls_mAP:
-                mAP = np.mean(AP_for_recall[r])
-                metrics['mAP(rec_{:.2f})_{}'.format(r, split_name)].append(mAP)
-            print('mAP computing time : {:.3f}'.format(time.time() - t0_ap))
-            delta = time.time() - t0
-            metrics['eval_' + split_name + '_time'] = [delta]
-            print('Eval time of {}: {:.4f}s'.format(split_name, delta))
-        for k in sorted(metrics.keys()):
-            v = np.mean(metrics[k])
-            print('{}: {:.4}'.format(k, v))
+        stats_epoch = _evaluate_model(model, train_evaluation_loader, valid_evaluation_loader)
+        stats_epoch['train_time'] = epoch_time
+        stats_epoch['epoch'] = epoch
+        for k, v in stats_epoch.items():
             stats[k].append(v)
-        stats['epoch'].append(epoch)
         pd.DataFrame(stats).to_csv(stats_filename, index=False)
-        
+
+
+def evaluate(*, config):
+    cfg = _read_config(config)
+    model = torch.load(os.path.join(cfg['out_folder'], 'model.th'))
+    model = model.cuda()
+    model.eval()
+    anchor_list = _build_anchor_list(cfg)
+    (train_dataset, valid_dataset), (train_evaluation, valid_evaluation) = _build_dataset(
+        cfg,
+        anchor_list=anchor_list,
+    )
+    clfn = lambda l:l
+    train_evaluation_loader = DataLoader(
+        train_evaluation,
+        batch_size=cfg['batch_size'],
+        collate_fn=clfn,
+        num_workers=cfg['num_workers'],
+    )
+    valid_evaluation_loader = DataLoader(
+        valid_evaluation,
+        batch_size=cfg['batch_size'],
+        collate_fn=clfn,
+        num_workers=cfg['num_workers'],
+    )
+    stats = _evaluate_model(model, train_evaluation_loader, valid_evaluation_loader)
+    for k in sorted(stats.keys()):
+        print('{}: {:.4f}'.format(k, stats[k]))
+
+
+def _evaluate_model(model, train, valid):
+    print('Evaluation')
+    bgid = train.dataset.class_to_idx['background']
+    t0 = time.time()
+    model.eval()
+    metrics = defaultdict(list)
+    cfg = model.config
+    class_ids = list(set(train.dataset.class_to_idx.values()) - set([bgid]))
+    class_ids = sorted(class_ids)
+    for split_name, loader in (('train', train), ('valid', valid)):
+        t0 = time.time()
+        im_index = 0
+        for batch, samples, in enumerate(loader):
+            tt0 = time.time()
+            X, (Y, Ypred), (bbox_true, bbox_pred), (class_true, class_pred) = _predict(model, samples)
+            X = X.data.cpu().numpy()
+
+            B = [[b for b, c in y] for y in Y]
+            B = [torch.from_numpy(np.array(b)).float() for b in B]
+            C = [[c for b, c in y] for y in Y]
+            C = [torch.from_numpy(np.array(c)).long() for c in C]
+             
+            # B contains groundtruth bounding boxes for each scale
+            # C contains groundtruth classes for each scale
+            BP = [
+                bp.data.cpu().view(bp.size(0), -1, model.num_coords, bp.size(2), bp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+            for bp, cp in Ypred]
+            CP = [
+                cp.data.cpu().view(cp.size(0), -1, model.nb_classes, cp.size(2), cp.size(3)).permute(0, 3, 4, 1, 2).numpy() 
+            for bp, cp in Ypred]
+            # BP contains predicted bounding boxes for each scale
+            # CP contains predicted classes for each scale
+            for i in range(len(X)):
+                gt_boxes = []
+                pred_boxes = []
+                gt_boxes_per_class = defaultdict(list)
+                pred_boxes_per_class = defaultdict(list)
+                # for each example i  in mini-batch
+                x = X[i]
+                x = x.transpose((1, 2, 0))
+                x = x * np.array(cfg['std']) + np.array(cfg['mean'])
+                x = x.astype('float32')
+
+                for j in range(len(Y)):
+                    # for each scale j
+                    ct = C[j][i]# class_id
+                    cp = CP[j][i]#cl1_score,cl2_score,...
+                    bt = B[j][i]#4
+                    bp = BP[j][i]#4
+                    if cfg['use_discrete_coords']:
+                        bp = _get_coords(bp, model.coords_discretization)
+                    A = model.anchor_list[j]
+                    # get groundtruth boxes
+                    gt_boxes.extend(decode_bounding_box_list(
+                        bt, ct, A, 
+                        include_scores=False,
+                        image_size=cfg['image_size'],
+                        variance=cfg['variance'],
+                    ))
+                    # get predicted boxes
+                    cp = get_probas(cp, cfg['classif_loss'], axis=3)
+                    pred_boxes.extend(decode_bounding_box_list(
+                        bp, cp, A, 
+                        include_scores=True,
+                        image_size=cfg['image_size'],
+                        variance=cfg['variance']
+                    ))
+                gt_boxes = [(box, class_id) for box, class_id in gt_boxes if class_id != bgid]
+                for class_id in class_ids:
+                    gt_boxes_per_class[class_id].extend([
+                        box
+                        for box, box_class_id in gt_boxes if class_id == box_class_id]
+                    )
+                # use the predicted boxes and groundtruth boxes to compute precision and recall
+                # PER image
+                pred_boxes = non_maximal_suppression_per_class(
+                    pred_boxes, 
+                    background_class_id=bgid,
+                    iou_threshold=cfg['nms_iou_threshold'],
+                    score_threshold=cfg['nms_score_threshold'],
+                )
+                for box, class_id, score in pred_boxes:
+                    pred_boxes_per_class[class_id].append((box, score))
+                pred_boxes = pred_boxes[0:cfg['nms_topk']]
+                P = []
+                R = []
+                for class_id in class_ids:
+                    t = [box for box, cl in gt_boxes if cl == class_id]
+                    if len(t) == 0:
+                        continue
+                    p = [box for box, cl, score in pred_boxes if cl == class_id]
+                    prec = precision(p, t, iou_threshold=cfg['eval_iou_threshold'])
+                    re = recall(p, t, iou_threshold=cfg['eval_iou_threshold'])
+                    metrics['precision_' + train.dataset.idx_to_class[class_id] + '_' + split_name].append(prec)
+                    metrics['recall_' + train.dataset.idx_to_class[class_id] + '_' + split_name].append(re)
+                    P.append(prec)
+                    R.append(re)
+                metrics['precision_' + split_name].append(np.mean(P))
+                metrics['recall_' + split_name].append(np.mean(R))
+                gt_boxes = [(box, train.dataset.idx_to_class[class_id]) for box, class_id in gt_boxes]
+                pred_boxes = [(box, train.dataset.idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
+                # compute mAP and AP PER image
+                recalls_mAP = np.linspace(0, 1, 11)
+                AP_for_recall = defaultdict(list)
+                AP_for_class = []
+                for class_id in class_ids:
+                    APs = average_precision(
+                        pred_boxes_per_class[class_id], gt_boxes_per_class[class_id], 
+                        iou_threshold=cfg['eval_iou_threshold'], 
+                        recalls_mAP=recalls_mAP,
+                        aggregate=False,
+                    )
+                    if APs is None:
+                        continue
+                    AP = np.mean(APs)
+                    AP_for_class.append(AP)
+                    metrics['AP_' + train.dataset.idx_to_class[class_id] + '_' + split_name].append(AP)
+                    for r, ap in zip(recalls_mAP, APs):
+                        m = 'AP(rec_{:.2f})_{}_{}'.format(r, train.dataset.idx_to_class[class_id], split_name)
+                        metrics[m].append(ap)
+                        AP_for_recall[r].append(ap)
+                mAP = np.mean(AP_for_class)
+                metrics['mAP_' + split_name].append(mAP)
+                for r in recalls_mAP:
+                    mAP = np.mean(AP_for_recall[r])
+                metrics['mAP(rec_{:.2f})_{}'.format(r, split_name)].append(mAP)
+                # draw boxes
+                pad = cfg['pad']
+                im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
+                im[pad:-pad, pad:-pad] = x
+                im = draw_bounding_boxes(im, gt_boxes, color=(1, 0, 0), text_color=(1, 0, 0), pad=pad)
+                im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+                imsave(os.path.join(cfg['out_folder'], 'eval_{}'.format(split_name), 'sample_{:05d}.jpg'.format(im_index)), im)
+                im_index += 1
+            delta = time.time() - tt0
+            print('Eval Batch {:04d}/{:04d} on split {}, Time : {:.3f}s'.format(batch + 1, len(loader), split_name, delta)) 
+        delta = time.time() - t0
+        metrics['eval_' + split_name + '_time'] = [delta]
+        print('Eval time of {}: {:.4f}s'.format(split_name, delta))
+
+    stats = {}
+    for k in sorted(metrics.keys()):
+        v = np.mean(metrics[k])
+        print('{}: {:.4}'.format(k, v))
+        stats[k] = v
+    return stats
+
 
 def _discrete_coords_loss(bp, bt, coords_discretization, **kwargs):
     # shape of bt: (n_examples, 4)
@@ -647,8 +692,14 @@ def test(
     model.eval()
     filenames = [os.path.join(in_folder, f) for f in os.listdir(in_folder)]
     for filename in filenames:
-        im = default_loader(filename)
+        t0 = time.time()
+        try:
+            im = default_loader(filename)
+        except OSError:
+            continue
+        w, h = im.size
         x = model.transform(im)
+        scale_w, scale_h = w / x.size(2), h / x.size(1)
         X = x.view(1, x.size(0), x.size(1), x.size(2))
         if cuda:
             X = X.cuda()
@@ -718,15 +769,22 @@ def test(
         pred_boxes = [(box, class_id, score) for box, class_id, score in pred_boxes if class_id != bgid]
         pred_boxes = [(box, idx_to_class[class_id], score) for box, class_id, score in pred_boxes]
         pred_boxes = pred_boxes[0:topk]
+        pred_boxes = [
+            ((x * scale_w, y * scale_h, w * scale_w, h * scale_h), class_name, score)
+            for (x, y, w, h), class_name, score in pred_boxes
+        ]
         for box, class_name, score in pred_boxes:
             print(class_name, score)
-        pad = model.config['pad']
-        im = np.zeros((x.shape[0] + pad * 2, x.shape[1] + pad * 2, x.shape[2]))
-        im[pad:-pad, pad:-pad] = x
-        im = draw_bounding_boxes(im, pred_boxes, color=(0, 1, 0), text_color=(0, 1, 0), pad=pad) 
+        im = np.array(im)
+        pad = int(model.config['pad'] * scale_w)
+        impadded = np.zeros((im.shape[0] + pad * 2, im.shape[1] + pad * 2, im.shape[2]))
+        impadded = impadded.astype('uint8')
+        impadded[pad:-pad, pad:-pad] = im
+        im = draw_bounding_boxes(impadded, pred_boxes, color=(0, 255, 0), text_color=(0, 255, 0), pad=pad)
+        delta = time.time() - t0
         outf = os.path.join(out_folder, os.path.basename(filename))
-        print(outf)
-        imsave(outf, im)
+        print('Processed {} in {:.3f}s'.format(outf, delta))
+        imsave(outf, impadded)
 
 
 def find_aspect_ratios(*, config='config', nb=6):
@@ -1093,5 +1151,6 @@ if __name__ == '__main__':
         draw_anchors, 
         find_aspect_ratios, 
         leaderboard, 
-        sample_hypers_and_train
+        sample_hypers_and_train,
+        evaluate,
     ])

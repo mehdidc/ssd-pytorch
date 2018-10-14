@@ -299,7 +299,7 @@ def average_precision(
 
     # -- get prediction list of bboxes 
     def score_fn(k):
-        bbox, im_index, score = k
+        bbox, score = k
         return score
     bbox_pred_list = sorted(bbox_pred_list, key=score_fn, reverse=True)
     
@@ -314,10 +314,8 @@ def average_precision(
     cdef int nb_recall = 0
     precisions = []
     recalls = []
-    for i, (bbox_pred, im_index_pred, _) in enumerate(bbox_pred_list):
-        for j, (bbox_true, im_index_true) in enumerate(bbox_true_list):
-            if im_index_pred != im_index_true:
-                continue
+    for i, (bbox_pred, _) in enumerate(bbox_pred_list):
+        for j, bbox_true in enumerate(bbox_true_list):
             if iou(bbox_pred, bbox_true) < iou_threshold:
                 continue
             if R[j] == 0:
